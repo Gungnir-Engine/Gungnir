@@ -10,6 +10,7 @@
 // max 24, used to interpolate MG and EG scores.
 
 #include "eval.h"
+#include "nnue.h"
 
 namespace gungnir {
 
@@ -157,6 +158,14 @@ constexpr int PST_EG[PIECE_TYPE_NB][SQ_NB] = {
 }  // namespace
 
 int evaluate(const Position& pos) {
+    if (NNUE::is_loaded() && NNUE::is_enabled()) {
+        // NNUE returns SF-internal cp from STM POV. Scale to roughly match
+        // our classical cp (where 100 = 1 pawn). SF's NormalizeToPawnValue
+        // is ~208 for the small net, so cp ≈ raw * 100 / 208 ≈ raw / 2.08.
+        const int raw = NNUE::evaluate(pos);
+        return raw * 100 / 208;
+    }
+
     int mg = 0;
     int eg = 0;
     int phase = 0;

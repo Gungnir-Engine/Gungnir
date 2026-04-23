@@ -9,6 +9,7 @@
 //   gungnir bench [depth]                → search a fixed set of positions
 
 #include "attacks.h"
+#include "nnue.h"
 #include "notation.h"
 #include "perft.h"
 #include "position.h"
@@ -106,10 +107,27 @@ static int run_bench(int depth) {
     return 0;
 }
 
+// Try to auto-load nn-small.nnue from a few standard locations.
+// Returns true if loaded.
+static bool try_auto_load_nnue() {
+    using namespace gungnir;
+    static const char* kCandidates[] = {
+        "nn-small.nnue",                     // CWD
+        "../nn-small.nnue",                  // build/Release/ → build/
+        "../../nn-small.nnue",               // build/Release/ → repo root
+        "E:/Claude/nn-small.nnue",           // hardcoded fallback
+    };
+    for (const char* path : kCandidates) {
+        if (NNUE::load(path)) return true;
+    }
+    return false;
+}
+
 int main(int argc, char** argv) {
     using namespace gungnir;
     init_zobrist();
     init_attacks();
+    try_auto_load_nnue();
 
     // Default: UCI loop. (Also explicit `gungnir uci`.)
     if (argc < 2 || std::string(argv[1]) == "uci") {
@@ -128,6 +146,42 @@ int main(int argc, char** argv) {
             try { depth = std::stoi(argv[2]); } catch (...) {}
         }
         return run_bench(depth);
+    }
+
+    if (mode == "nnueverify") {
+        print_banner();
+        if (!NNUE::is_loaded()) {
+            std::cerr << "NNUE not loaded — couldn't find nn-small.nnue.\n";
+            return 1;
+        }
+        std::cout << "NNUE loaded.\n";
+        std::cout << "  arch hash: 0x" << std::hex << NNUE::arch_hash() << std::dec << "\n";
+        std::cout << "  desc:      " << NNUE::description().substr(0, 70) << "\n\n";
+
+        struct TestPos { const char* name; const char* fen; };
+        TestPos tests[] = {
+            {"startpos (white)", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"},
+            {"startpos (black)", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1"},
+            {"KQvK (white)",    "8/8/8/4k3/8/8/8/3QK3 w - - 0 1"},
+            {"KQvK (black)",    "8/8/8/4k3/8/8/8/3QK3 b - - 0 1"},
+            {"KRvK",            "8/8/8/4k3/8/8/8/3RK3 w - - 0 1"},
+            {"Italian",         "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4"},
+        };
+        Position pos;
+        for (auto& t : tests) {
+            pos.set_from_fen(t.fen);
+            int feat_w[40], feat_b[40];
+            const int nw = NNUE::features(pos, 0, feat_w);
+            const int nb = NNUE::features(pos, 1, feat_b);
+            const int raw = NNUE::evaluate(pos);
+            const int cp  = raw * 100 / 208;
+            std::cout << t.name << "\n"
+                      << "  features: white=" << nw << " black=" << nb << "\n"
+                      << "  first w-feat=" << feat_w[0] << "  first b-feat=" << feat_b[0] << "\n"
+                      << "  raw eval (SF internal cp): " << raw
+                      << "  →  cp: " << cp << "\n\n";
+        }
+        return 0;
     }
 
     int depth = 4;

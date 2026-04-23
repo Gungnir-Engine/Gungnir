@@ -42,6 +42,39 @@ struct ScoredMove { Move move; int score; };
 
 constexpr int SCORE_TT_MOVE     = 1'000'000;
 constexpr int SCORE_CAPTURE     =   100'000;  // base; MVV-LVA delta added on top
+constexpr int SCORE_KILLER1     =    90'000;
+constexpr int SCORE_KILLER2     =    80'000;
+constexpr int MAX_PLY           = 96;
+
+// Killers + history persist across the iterative-deepening run (cleared at
+// start of each `search()`). Killers store quiet moves that produced a beta
+// cutoff at this ply; history is indexed by [stm][from][to] and accumulates
+// depth² on cutoff for use as a quiet-move ordering signal.
+Move g_killers[MAX_PLY][2];
+int  g_history[COLOR_NB][SQ_NB][SQ_NB];
+
+void clear_killers_history() {
+    for (int p = 0; p < MAX_PLY; ++p) {
+        g_killers[p][0] = MOVE_NULL;
+        g_killers[p][1] = MOVE_NULL;
+    }
+    std::memset(g_history, 0, sizeof(g_history));
+}
+
+inline void update_killer(int ply, Move m) {
+    if (g_killers[ply][0] == m) return;
+    g_killers[ply][1] = g_killers[ply][0];
+    g_killers[ply][0] = m;
+}
+
+inline void update_history(Color stm, Move m, int depth) {
+    int& h = g_history[stm][m.from()][m.to()];
+    h += depth * depth;
+    if (h > 100000) {
+        // Halve everything in this row to avoid runaway. Cheap and effective.
+        for (int s = 0; s < SQ_NB; ++s) g_history[stm][m.from()][s] /= 2;
+    }
+}
 
 inline bool is_capture(const Position& pos, Move m) {
     if (m.type() == MT_EN_PASSANT) return true;
@@ -54,16 +87,23 @@ inline PieceType victim_type(const Position& pos, Move m) {
 }
 
 void score_moves(const Position& pos, const MoveList& list,
-                 ScoredMove* out, Move tt_move) {
+                 ScoredMove* out, Move tt_move, int ply) {
+    const Color stm = pos.stm();
     for (int i = 0; i < list.size; ++i) {
         const Move m = list.moves[i];
-        int s = 0;
+        int s;
         if (m == tt_move) {
             s = SCORE_TT_MOVE;
         } else if (is_capture(pos, m)) {
             const PieceType v = victim_type(pos, m);
             const PieceType a = type_of(pos.piece_on(m.from()));
             s = SCORE_CAPTURE + piece_value[v] * 16 - piece_value[a];
+        } else if (ply < MAX_PLY && m == g_killers[ply][0]) {
+            s = SCORE_KILLER1;
+        } else if (ply < MAX_PLY && m == g_killers[ply][1]) {
+            s = SCORE_KILLER2;
+        } else {
+            s = g_history[stm][m.from()][m.to()];
         }
         out[i] = {m, s};
     }
@@ -155,7 +195,7 @@ int qsearch(Position& pos, int alpha, int beta, int ply) {
 constexpr int MAX_EXTENSIONS = 16;
 
 int negamax(Position& pos, int depth, int alpha, int beta, int ply, int extensions,
-            Move* pv, int* pv_len) {
+            bool did_null, Move* pv, int* pv_len) {
     if ((++g_nodes & 2047) == 0 && should_stop()) {
         g_aborted = true;
         return 0;
@@ -178,6 +218,7 @@ int negamax(Position& pos, int depth, int alpha, int beta, int ply, int extensio
     const bool in_check = pos.in_check();
     const bool can_extend = in_check && extensions < MAX_EXTENSIONS;
     const int  next_extensions = extensions + (can_extend ? 1 : 0);
+    const bool is_pv_node = (beta - alpha > 1);
 
     // --- TT probe ---
     bool found;
@@ -193,6 +234,30 @@ int negamax(Position& pos, int depth, int alpha, int beta, int ply, int extensio
         }
     }
 
+    Move child_pv_buf[64];
+    int  child_pv_len = 0;
+
+    // --- Null-move pruning ---
+    // Skip our turn; if opponent can't beat beta with reduced depth, we can
+    // safely prune (we're so far ahead that even passing leaves us winning).
+    // Conditions: not in check, not already null-moved (no consecutive nulls),
+    // not a PV node, depth >= 3, and we have non-pawn material to avoid
+    // zugzwang (in pawn endings null-move can be wrong).
+    if (!is_pv_node && !in_check && !did_null && depth >= 3
+        && pos.has_non_pawn_material(pos.stm())) {
+        const int R = 2 + depth / 4;
+        pos.make_null_move();
+        const int score = -negamax(pos, depth - R - 1, -beta, -beta + 1, ply + 1,
+                                   extensions, true, child_pv_buf, &child_pv_len);
+        pos.unmake_null_move();
+        if (g_aborted) return 0;
+        if (score >= beta) {
+            // Don't return mate scores from null-move (could be unsound).
+            if (score >= VALUE_MATE_IN_MAX) return beta;
+            return score;
+        }
+    }
+
     MoveList list;
     generate_legal(pos, list);
 
@@ -201,10 +266,7 @@ int negamax(Position& pos, int depth, int alpha, int beta, int ply, int extensio
     }
 
     ScoredMove scored[256];
-    score_moves(pos, list, scored, tt_move);
-
-    Move child_pv[64];
-    int  child_pv_len = 0;
+    score_moves(pos, list, scored, tt_move, ply);
 
     Move best_move = MOVE_NULL;
     int  best = -VALUE_INF;
@@ -216,7 +278,7 @@ int negamax(Position& pos, int depth, int alpha, int beta, int ply, int extensio
         pos.make_move(m);
         const int new_depth = depth - 1 + (can_extend ? 1 : 0);  // check extension (capped)
         const int score = -negamax(pos, new_depth, -beta, -alpha, ply + 1,
-                                   next_extensions, child_pv, &child_pv_len);
+                                   next_extensions, false, child_pv_buf, &child_pv_len);
         pos.unmake_move(m);
 
         if (g_aborted) return 0;
@@ -229,12 +291,21 @@ int negamax(Position& pos, int depth, int alpha, int beta, int ply, int extensio
                 // Update PV: best move + child PV
                 pv[0] = m;
                 for (int j = 0; j < child_pv_len && j + 1 < 64; ++j) {
-                    pv[j + 1] = child_pv[j];
+                    pv[j + 1] = child_pv_buf[j];
                 }
                 *pv_len = std::min(child_pv_len + 1, 64);
             }
         }
-        if (alpha >= beta) break;
+        if (alpha >= beta) {
+            // Beta cutoff. If the cutoff move is a quiet move (not a capture),
+            // remember it as a killer at this ply and bump its history score
+            // so future move ordering tries it earlier.
+            if (!is_capture(pos, m) && ply < MAX_PLY) {
+                update_killer(ply, m);
+                update_history(pos.stm(), m, depth);
+            }
+            break;
+        }
     }
 
     // --- TT store ---
@@ -281,6 +352,7 @@ SearchInfo search(Position& pos, const SearchLimits& limits) {
     g_use_time = !limits.infinite && limits.hard_ms > 0;
     g_hard_ms = limits.hard_ms;
     TT::new_search();
+    clear_killers_history();
 
     SearchInfo result;
     result.best_move = MOVE_NULL;
@@ -300,7 +372,7 @@ SearchInfo search(Position& pos, const SearchLimits& limits) {
 
         int score;
         while (true) {
-            score = negamax(pos, depth, alpha, beta, 0, 0, pv, &pv_len);
+            score = negamax(pos, depth, alpha, beta, 0, 0, false, pv, &pv_len);
             if (g_aborted) break;
             if (score <= alpha) {            // fail low — widen alpha
                 beta  = (alpha + beta) / 2;

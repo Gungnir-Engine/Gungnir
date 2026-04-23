@@ -53,6 +53,17 @@ public:
     void make_move(Move m);
     void unmake_move(Move m);
 
+    // Null move (for null-move pruning in search): just flips stm, clears ep,
+    // bumps halfmove. No piece movement.
+    void make_null_move();
+    void unmake_null_move();
+
+    // True if `c` has any piece other than pawns and the king. Used to gate
+    // null-move pruning (avoid zugzwang in pawn endings).
+    bool has_non_pawn_material(Color c) const {
+        return (occupancy_[c] & ~(by_type_[PAWN] | by_type_[KING])) != 0;
+    }
+
     // Queries
     Color stm() const { return stm_; }
     Piece piece_on(Square s) const { return board_[s]; }

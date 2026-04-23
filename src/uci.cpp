@@ -1,5 +1,6 @@
 #include "uci.h"
 
+#include "nnue.h"
 #include "notation.h"
 #include "position.h"
 #include "search.h"
@@ -101,9 +102,33 @@ int uci_loop() {
         if (!(iss >> token)) continue;
 
         if (token == "uci") {
-            std::cout << "id name Gungnir 0.3-dev" << std::endl;
-            std::cout << "id author Gungnir Dev" << std::endl;
+            std::cout << "id name Gungnir 0.4-dev" << std::endl;
+            std::cout << "id author Gungnir-Engine" << std::endl;
+            std::cout << "option name Hash type spin default 16 min 1 max 1024" << std::endl;
+            std::cout << "option name UseNNUE type check default true" << std::endl;
+            std::cout << "option name NNUEFile type string default nn-small.nnue" << std::endl;
             std::cout << "uciok" << std::endl;
+        } else if (token == "setoption") {
+            // setoption name <name> value <value>
+            std::string sub, name, value;
+            iss >> sub;  // "name"
+            // Read name tokens until "value"
+            while (iss >> sub && sub != "value") {
+                if (!name.empty()) name += ' ';
+                name += sub;
+            }
+            std::string vpart;
+            while (iss >> vpart) {
+                if (!value.empty()) value += ' ';
+                value += vpart;
+            }
+            if (name == "Hash") {
+                try { TT::init(size_t(std::stoi(value))); } catch (...) {}
+            } else if (name == "UseNNUE") {
+                NNUE::set_enabled(value == "true" || value == "True" || value == "1");
+            } else if (name == "NNUEFile") {
+                NNUE::load(value);
+            }
         } else if (token == "isready") {
             std::cout << "readyok" << std::endl;
         } else if (token == "ucinewgame") {

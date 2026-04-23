@@ -1,0 +1,471 @@
+// Gungnir — Stockfish HalfKAv2_hm NNUE implementation.
+// Ported from chess.html Sessions 12–13 (SF17 small net). All integer math.
+
+#include "nnue.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <vector>
+
+namespace gungnir {
+namespace NNUE {
+
+// ============================================================================
+// Constants — small-net architecture
+// ============================================================================
+
+constexpr unsigned long EXPECTED_VERSION   = 0x7AF32F20UL;
+constexpr unsigned long EXPECTED_ARCH_HASH = 0x1C103C92UL;
+constexpr unsigned long EXPECTED_FT_HASH   = 0x7F234DB8UL;
+constexpr int FT_INPUT_DIM   = 22528;     // HalfKAv2_hm
+constexpr int FT_OUTPUT_DIM  = 128;       // TransformedFeatureDimensionsSmall
+constexpr int PSQT_BUCKETS   = 8;
+constexpr int LAYER_STACKS   = 8;
+constexpr int L2             = 15;        // FC_0 outputs we use (16th is skip)
+constexpr int FC0_OUT        = L2 + 1;    // 16
+constexpr int FC1_IN_PAD     = 32;        // 30 used + 2 pad
+constexpr int FC1_OUT        = 32;
+constexpr int FC2_IN_PAD     = 32;
+constexpr int LEB128_MAGIC_LEN = 17;
+constexpr const char* LEB128_MAGIC_STR = "COMPRESSED_LEB128";
+
+// HalfKAv2_hm piece-square index bases (from half_ka_v2_hm.h).
+constexpr int PS_NB        = 11 * 64;
+constexpr int PS_W_PAWN    = 0  * 64;
+constexpr int PS_B_PAWN    = 1  * 64;
+constexpr int PS_W_KNIGHT  = 2  * 64;
+constexpr int PS_B_KNIGHT  = 3  * 64;
+constexpr int PS_W_BISHOP  = 4  * 64;
+constexpr int PS_B_BISHOP  = 5  * 64;
+constexpr int PS_W_ROOK    = 6  * 64;
+constexpr int PS_B_ROOK    = 7  * 64;
+constexpr int PS_W_QUEEN   = 8  * 64;
+constexpr int PS_B_QUEEN   = 9  * 64;
+constexpr int PS_KING      = 10 * 64;
+
+// PieceSquareIndex[perspective][piece_code 0..15]
+constexpr int PieceSquareIndex[2][16] = {
+    {  // white perspective
+        0,
+        PS_W_PAWN,   PS_W_KNIGHT, PS_W_BISHOP, PS_W_ROOK,
+        PS_W_QUEEN,  PS_KING,     0, 0,
+        PS_B_PAWN,   PS_B_KNIGHT, PS_B_BISHOP, PS_B_ROOK,
+        PS_B_QUEEN,  PS_KING,     0,
+    },
+    {  // black perspective
+        0,
+        PS_B_PAWN,   PS_B_KNIGHT, PS_B_BISHOP, PS_B_ROOK,
+        PS_B_QUEEN,  PS_KING,     0, 0,
+        PS_W_PAWN,   PS_W_KNIGHT, PS_W_BISHOP, PS_W_ROOK,
+        PS_W_QUEEN,  PS_KING,     0,
+    },
+};
+
+// ============================================================================
+// Orient / KingBuckets tables (filled at init)
+// ============================================================================
+
+namespace {
+
+int g_orient[2][64];
+int g_king_buckets[2][64];
+
+void build_orient(int* dst, int base_ad, int base_eh) {
+    for (int r = 0; r < 8; ++r) {
+        for (int f = 0; f < 4; ++f) dst[r * 8 + f] = base_ad;
+        for (int f = 4; f < 8; ++f) dst[r * 8 + f] = base_eh;
+    }
+}
+
+// rows[r] is rank-r (a1=rank0). For white perspective: rank 1 is white's home.
+// For black perspective: array is the same shape but in black's POV — rank 1
+// (SF coords) = the far rank from black's view, which gets the small bucket
+// numbers, while rank 8 (SF coords) is black's home (gets the big numbers).
+constexpr int kKingBucketsWhite[8][8] = {
+    {28, 29, 30, 31, 31, 30, 29, 28},  // rank 1 (white home)
+    {24, 25, 26, 27, 27, 26, 25, 24},
+    {20, 21, 22, 23, 23, 22, 21, 20},
+    {16, 17, 18, 19, 19, 18, 17, 16},
+    {12, 13, 14, 15, 15, 14, 13, 12},
+    { 8,  9, 10, 11, 11, 10,  9,  8},
+    { 4,  5,  6,  7,  7,  6,  5,  4},
+    { 0,  1,  2,  3,  3,  2,  1,  0},
+};
+constexpr int kKingBucketsBlack[8][8] = {
+    { 0,  1,  2,  3,  3,  2,  1,  0},
+    { 4,  5,  6,  7,  7,  6,  5,  4},
+    { 8,  9, 10, 11, 11, 10,  9,  8},
+    {12, 13, 14, 15, 15, 14, 13, 12},
+    {16, 17, 18, 19, 19, 18, 17, 16},
+    {20, 21, 22, 23, 23, 22, 21, 20},
+    {24, 25, 26, 27, 27, 26, 25, 24},
+    {28, 29, 30, 31, 31, 30, 29, 28},
+};
+
+void init_tables() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    // White: a-d files → flip (XOR 7), e-h files → identity (XOR 0).
+    build_orient(g_orient[0], 7, 0);
+    // Black: a-d files → flip both (XOR 63), e-h files → flip rank only (XOR 56).
+    build_orient(g_orient[1], 63, 56);
+
+    for (int r = 0; r < 8; ++r) for (int f = 0; f < 8; ++f) {
+        g_king_buckets[0][r * 8 + f] = kKingBucketsWhite[r][f] * PS_NB;
+        g_king_buckets[1][r * 8 + f] = kKingBucketsBlack[r][f] * PS_NB;
+    }
+}
+
+}  // namespace
+
+// ============================================================================
+// LEB128 reader
+// ============================================================================
+
+namespace {
+
+// Reads `count` signed-LEB128 ints (sign-extended to `bits`-wide) into out[].
+// Advances `*pp`. `bits` is 16 for FT biases/weights, 32 for PSQT.
+bool read_leb128(const uint8_t** pp, const uint8_t* end, int count, int bits, int32_t* out) {
+    const uint8_t* p = *pp;
+    if (end - p < LEB128_MAGIC_LEN + 4) return false;
+    if (std::memcmp(p, LEB128_MAGIC_STR, LEB128_MAGIC_LEN) != 0) return false;
+    p += LEB128_MAGIC_LEN;
+    uint32_t bytes_left;
+    std::memcpy(&bytes_left, p, 4);  // little-endian on x86
+    p += 4;
+    const uint8_t* block_end = p + bytes_left;
+    if (block_end > end) return false;
+
+    for (int i = 0; i < count; ++i) {
+        int32_t result = 0;
+        int shift = 0;
+        while (true) {
+            if (p >= block_end) return false;
+            uint8_t b = *p++;
+            result |= int32_t(b & 0x7F) << shift;
+            shift += 7;
+            if ((b & 0x80) == 0) {
+                if (shift < bits && (b & 0x40) != 0) {
+                    result |= ~((int32_t(1) << shift) - 1);
+                }
+                break;
+            }
+            if (shift >= bits) return false;
+        }
+        out[i] = result;
+    }
+    if (p != block_end) return false;
+    *pp = p;
+    return true;
+}
+
+}  // namespace
+
+// ============================================================================
+// Loaded weights
+// ============================================================================
+
+namespace {
+
+bool g_loaded = false;
+bool g_enabled = false;
+unsigned long g_version = 0;
+unsigned long g_arch_hash = 0;
+unsigned long g_ft_hash = 0;
+std::string g_desc;
+
+// FT biases, weights, PSQT weights.
+std::vector<int16_t> g_ft_biases;        // size = FT_OUTPUT_DIM
+std::vector<int16_t> g_ft_weights;       // size = FT_INPUT_DIM * FT_OUTPUT_DIM
+std::vector<int32_t> g_ft_psqt_weights;  // size = PSQT_BUCKETS * FT_INPUT_DIM
+
+// 8 layer stacks — each owns small dense arrays.
+struct LayerStack {
+    uint32_t hash;
+    int32_t  fc0_b[FC0_OUT];          // 16 int32 biases
+    int8_t   fc0_w[FC0_OUT * FT_OUTPUT_DIM];  // 16 * 128
+    int32_t  fc1_b[FC1_OUT];          // 32 int32 biases
+    int8_t   fc1_w[FC1_OUT * FC1_IN_PAD];     // 32 * 32
+    int32_t  fc2_b[1];
+    int8_t   fc2_w[FC2_IN_PAD];       // 32
+};
+LayerStack g_stacks[LAYER_STACKS];
+
+uint32_t read_u32(const uint8_t*& p) {
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    p += 4;
+    return v;
+}
+int32_t read_i32(const uint8_t*& p) {
+    int32_t v;
+    std::memcpy(&v, p, 4);
+    p += 4;
+    return v;
+}
+
+}  // namespace
+
+// ============================================================================
+// File parsing
+// ============================================================================
+
+bool load(const std::string& path) {
+    init_tables();
+    g_loaded = false;
+
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        std::cerr << "NNUE: cannot open " << path << std::endl;
+        return false;
+    }
+    const std::streamsize file_size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buf;
+    buf.resize(static_cast<size_t>(file_size));
+    if (!in.read(reinterpret_cast<char*>(&buf[0]), file_size)) {
+        std::cerr << "NNUE: read failed" << std::endl;
+        return false;
+    }
+
+    const uint8_t* p   = buf.data();
+    const uint8_t* end = buf.data() + buf.size();
+
+    if (end - p < 12) return false;
+    g_version  = read_u32(p);
+    g_arch_hash = read_u32(p);
+    uint32_t desc_len = read_u32(p);
+    if (uint32_t(end - p) < desc_len) return false;
+    g_desc.assign(reinterpret_cast<const char*>(p), desc_len);
+    p += desc_len;
+
+    if (g_version != EXPECTED_VERSION) {
+        std::cerr << "NNUE: unsupported version 0x" << std::hex << g_version
+                  << " (expected 0x" << EXPECTED_VERSION << ")" << std::dec << std::endl;
+        return false;
+    }
+    if (end - p < 4) return false;
+    g_ft_hash = read_u32(p);
+
+    // Feature transformer (LEB128-compressed)
+    g_ft_biases.assign(FT_OUTPUT_DIM, 0);
+    g_ft_weights.assign(size_t(FT_INPUT_DIM) * FT_OUTPUT_DIM, 0);
+    g_ft_psqt_weights.assign(size_t(PSQT_BUCKETS) * FT_INPUT_DIM, 0);
+
+    {
+        std::vector<int32_t> tmp(FT_OUTPUT_DIM);
+        if (!read_leb128(&p, end, FT_OUTPUT_DIM, 16, tmp.data())) {
+            std::cerr << "NNUE: FT biases LEB128 parse failed" << std::endl;
+            return false;
+        }
+        for (int i = 0; i < FT_OUTPUT_DIM; ++i) g_ft_biases[i] = int16_t(tmp[i]);
+    }
+    {
+        std::vector<int32_t> tmp(size_t(FT_INPUT_DIM) * FT_OUTPUT_DIM);
+        if (!read_leb128(&p, end, int(tmp.size()), 16, tmp.data())) {
+            std::cerr << "NNUE: FT weights LEB128 parse failed" << std::endl;
+            return false;
+        }
+        for (size_t i = 0; i < tmp.size(); ++i) g_ft_weights[i] = int16_t(tmp[i]);
+    }
+    if (!read_leb128(&p, end, int(g_ft_psqt_weights.size()), 32, g_ft_psqt_weights.data())) {
+        std::cerr << "NNUE: FT PSQT weights LEB128 parse failed" << std::endl;
+        return false;
+    }
+
+    // 8 layer stacks (raw little-endian, NOT compressed)
+    for (int s = 0; s < LAYER_STACKS; ++s) {
+        if (end - p < 4) return false;
+        g_stacks[s].hash = read_u32(p);
+
+        // fc_0
+        if (end - p < int(sizeof(int32_t)) * FC0_OUT + FC0_OUT * FT_OUTPUT_DIM) return false;
+        for (int i = 0; i < FC0_OUT; ++i) g_stacks[s].fc0_b[i] = read_i32(p);
+        std::memcpy(g_stacks[s].fc0_w, p, FC0_OUT * FT_OUTPUT_DIM);
+        p += FC0_OUT * FT_OUTPUT_DIM;
+
+        // fc_1
+        if (end - p < int(sizeof(int32_t)) * FC1_OUT + FC1_OUT * FC1_IN_PAD) return false;
+        for (int i = 0; i < FC1_OUT; ++i) g_stacks[s].fc1_b[i] = read_i32(p);
+        std::memcpy(g_stacks[s].fc1_w, p, FC1_OUT * FC1_IN_PAD);
+        p += FC1_OUT * FC1_IN_PAD;
+
+        // fc_2
+        if (end - p < int(sizeof(int32_t)) + FC2_IN_PAD) return false;
+        g_stacks[s].fc2_b[0] = read_i32(p);
+        std::memcpy(g_stacks[s].fc2_w, p, FC2_IN_PAD);
+        p += FC2_IN_PAD;
+    }
+
+    if (p != end) {
+        std::cerr << "NNUE: warning — " << (end - p) << " trailing bytes after layer stacks" << std::endl;
+    }
+
+    g_loaded = true;
+    g_enabled = true;
+    std::cerr << "NNUE: loaded " << path << " (" << file_size << " bytes, "
+              << g_desc.substr(0, 40)
+              << (g_desc.size() > 40 ? "..." : "") << ")" << std::endl;
+    return true;
+}
+
+bool is_loaded()                  { return g_loaded; }
+void set_enabled(bool on)         { g_enabled = on && g_loaded; }
+bool is_enabled()                 { return g_enabled; }
+const std::string& description()  { return g_desc; }
+unsigned long file_version()      { return g_version; }
+unsigned long arch_hash()         { return g_arch_hash; }
+
+// ============================================================================
+// Feature extraction
+// ============================================================================
+
+int features(const Position& pos, int perspective, int* out) {
+    init_tables();
+    const Color me = (perspective == 0) ? WHITE : BLACK;
+    const Square king_sq = pos.king_square(me);
+    const int orient = g_orient[perspective][king_sq];
+    const int kb     = g_king_buckets[perspective][king_sq];
+    const int* psidx = PieceSquareIndex[perspective];
+    int count = 0;
+    for (Square s = SQ_A1; s < SQ_NONE; ++s) {
+        const Piece p = pos.piece_on(s);
+        if (p == NO_PIECE) continue;
+        const int feat = (int(s) ^ orient) + psidx[p] + kb;
+        out[count++] = feat;
+    }
+    return count;
+}
+
+// ============================================================================
+// Forward pass — matches Stockfish portable path exactly
+// ============================================================================
+
+int evaluate(const Position& pos) {
+    if (!g_loaded) return 0;
+    constexpr int D = FT_OUTPUT_DIM;     // 128
+    constexpr int H = D / 2;              // 64
+
+    int feat_w[40], feat_b[40];
+    const int n_w = features(pos, 0, feat_w);
+    const int n_b = features(pos, 1, feat_b);
+
+    // 1. FT accumulators (start from biases, add feature rows)
+    int32_t acc_w[D], acc_b[D];
+    for (int i = 0; i < D; ++i) {
+        acc_w[i] = g_ft_biases[i];
+        acc_b[i] = g_ft_biases[i];
+    }
+    for (int f = 0; f < n_w; ++f) {
+        const int16_t* row = &g_ft_weights[size_t(feat_w[f]) * D];
+        for (int i = 0; i < D; ++i) acc_w[i] += row[i];
+    }
+    for (int f = 0; f < n_b; ++f) {
+        const int16_t* row = &g_ft_weights[size_t(feat_b[f]) * D];
+        for (int i = 0; i < D; ++i) acc_b[i] += row[i];
+    }
+
+    // 2. PSQT accumulators
+    int32_t psqt_w[PSQT_BUCKETS] = {0}, psqt_b[PSQT_BUCKETS] = {0};
+    for (int f = 0; f < n_w; ++f) {
+        const int32_t* row = &g_ft_psqt_weights[size_t(feat_w[f]) * PSQT_BUCKETS];
+        for (int k = 0; k < PSQT_BUCKETS; ++k) psqt_w[k] += row[k];
+    }
+    for (int f = 0; f < n_b; ++f) {
+        const int32_t* row = &g_ft_psqt_weights[size_t(feat_b[f]) * PSQT_BUCKETS];
+        for (int k = 0; k < PSQT_BUCKETS; ++k) psqt_b[k] += row[k];
+    }
+
+    // 3. Pairwise transform (for each perspective: ft[j] = clamp(acc[j],0,127) * clamp(acc[j+H],0,127) / 128)
+    int32_t ft_out[D];
+    const Color stm = pos.stm();
+    int32_t* perspective_acc[2] = {
+        (stm == WHITE) ? acc_w : acc_b,   // STM perspective first
+        (stm == WHITE) ? acc_b : acc_w,   // opp perspective second
+    };
+    for (int p = 0; p < 2; ++p) {
+        const int32_t* acc = perspective_acc[p];
+        int32_t* dst = ft_out + p * H;
+        for (int j = 0; j < H; ++j) {
+            int32_t s0 = acc[j];
+            int32_t s1 = acc[j + H];
+            if (s0 < 0) s0 = 0; else if (s0 > 127) s0 = 127;
+            if (s1 < 0) s1 = 0; else if (s1 > 127) s1 = 127;
+            dst[j] = (s0 * s1) >> 7;
+        }
+    }
+
+    // 4. Bucket: (piece_count - 1) / 4
+    const int piece_count = popcount(pos.pieces());
+    const int bucket = (piece_count - 1) / 4;
+
+    // 5. PSQT diff
+    const int32_t* psqt_stm = (stm == WHITE) ? psqt_w : psqt_b;
+    const int32_t* psqt_opp = (stm == WHITE) ? psqt_b : psqt_w;
+    const int32_t psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
+
+    const LayerStack& ls = g_stacks[bucket];
+
+    // 6. fc_0: 16 int32 outputs from 128 uint8 inputs
+    int32_t fc0[FC0_OUT];
+    for (int j = 0; j < FC0_OUT; ++j) {
+        int32_t s = ls.fc0_b[j];
+        const int8_t* row = &ls.fc0_w[j * FT_OUTPUT_DIM];
+        for (int i = 0; i < FT_OUTPUT_DIM; ++i) s += ft_out[i] * row[i];
+        fc0[j] = s;
+    }
+
+    // 7. ac_sqr_0[0..14] = clamp(min(127, (x*x) >> 19), 0, 127)
+    //    ac_0    [0..14] = clamp(x >> 6, 0, 127)
+    //    Concatenated into 30 uint8s, padded to 32 with zeros.
+    int32_t fc1_in[FC1_IN_PAD] = {0};
+    for (int j = 0; j < L2; ++j) {
+        const int32_t x = fc0[j];
+        int32_t sq = (x * x) >> 19;
+        if (sq > 127) sq = 127;
+        fc1_in[j] = sq;
+    }
+    for (int j = 0; j < L2; ++j) {
+        int32_t v = fc0[j] >> 6;
+        if (v < 0) v = 0; else if (v > 127) v = 127;
+        fc1_in[L2 + j] = v;
+    }
+    // fc1_in[30..31] already zero
+
+    // 8. fc_1: 32 outputs from 32 inputs
+    int32_t fc1[FC1_OUT];
+    for (int j = 0; j < FC1_OUT; ++j) {
+        int32_t s = ls.fc1_b[j];
+        const int8_t* row = &ls.fc1_w[j * FC1_IN_PAD];
+        for (int i = 0; i < FC1_IN_PAD; ++i) s += fc1_in[i] * row[i];
+        fc1[j] = s;
+    }
+
+    // 9. ac_1 (clipped relu)
+    int32_t fc2_in[FC2_IN_PAD];
+    for (int j = 0; j < FC1_OUT; ++j) {
+        int32_t v = fc1[j] >> 6;
+        if (v < 0) v = 0; else if (v > 127) v = 127;
+        fc2_in[j] = v;
+    }
+
+    // 10. fc_2: scalar
+    int32_t fc2 = ls.fc2_b[0];
+    for (int i = 0; i < FC2_IN_PAD; ++i) fc2 += fc2_in[i] * ls.fc2_w[i];
+
+    // 11. Skip connection: fc0[15] * 9600 / 8128
+    const int32_t fwd_out = (fc0[15] * 9600) / 8128;
+    const int32_t positional = fc2 + fwd_out;
+
+    // 12. Final eval (SF internal cp): (psqt + positional) / 16
+    return (psqt + positional) / 16;
+}
+
+}  // namespace NNUE
+}  // namespace gungnir

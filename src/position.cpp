@@ -353,6 +353,32 @@ void Position::make_move(Move m) {
     stm_ = them;
 }
 
+void Position::make_null_move() {
+    assert(history_size_ < 1024);
+    assert(!in_check());  // null-move illegal if in check
+    history_[history_size_++] = state_;
+
+    u64 h = state_.hash;
+    if (state_.ep_square != SQ_NONE) {
+        h ^= Zobrist::enpassant[file_of(state_.ep_square)];
+    }
+    h ^= Zobrist::side;
+
+    state_.ep_square = SQ_NONE;
+    state_.captured  = NO_PIECE;
+    state_.halfmove += 1;
+    state_.hash      = h;
+
+    if (stm_ == BLACK) ++fullmove_;
+    stm_ = ~stm_;
+}
+
+void Position::unmake_null_move() {
+    stm_ = ~stm_;
+    if (stm_ == BLACK) --fullmove_;
+    state_ = history_[--history_size_];
+}
+
 void Position::unmake_move(Move m) {
     const Square from = m.from();
     const Square to = m.to();

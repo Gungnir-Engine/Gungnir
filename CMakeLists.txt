@@ -35,6 +35,7 @@ add_executable(gungnir
     src/tt.cpp
     src/search.cpp
     src/uci.cpp
+    src/nnue.cpp
 )
 
 target_include_directories(gungnir PRIVATE src)
