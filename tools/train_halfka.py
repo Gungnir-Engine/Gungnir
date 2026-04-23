@@ -210,6 +210,8 @@ def main():
     ap.add_argument('--lr',     type=float, default=1e-3)
     ap.add_argument('--max',    type=int, default=-1, help='Use at most N labels (default: all)')
     ap.add_argument('--workers',type=int, default=0)
+    ap.add_argument('--save-every', type=int, default=5,
+                    help='Save checkpoint every N epochs (default: 5)')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -254,10 +256,16 @@ def main():
         print(f"epoch {epoch+1}/{args.epochs} done in {dt:.1f}s  avg_loss={total_loss/max(1,n_batches):.6f}",
               flush=True)
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    torch.save(net.state_dict(), args.out)
-    print(f"Saved PyTorch checkpoint to {args.out}", flush=True)
-    print("Next: run tools/save_nnue.py (Session 46) to convert to a Gungnir-loadable .nnue.", flush=True)
+        # Periodic checkpoint (survives crashes / allows early inspection).
+        if args.save_every > 0 and ((epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1):
+            os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
+            ckpt_path = args.out if epoch == args.epochs - 1 else \
+                        args.out.replace('.pt', f'.e{epoch+1}.pt')
+            torch.save(net.state_dict(), ckpt_path)
+            print(f"  [checkpoint: {ckpt_path}]", flush=True)
+
+    print(f"Saved final PyTorch checkpoint to {args.out}", flush=True)
+    print("Next: run tools/save_nnue.py to convert to a Gungnir-loadable .nnue.", flush=True)
 
 
 if __name__ == '__main__':
