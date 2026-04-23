@@ -26,6 +26,9 @@ add_executable(gungnir
     src/main.cpp
     src/bitboard.cpp
     src/attacks.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/perft.cpp
 )
 
 target_include_directories(gungnir PRIVATE src)

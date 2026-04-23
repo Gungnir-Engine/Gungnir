@@ -35,3 +35,6 @@ desktop.ini
 # Editor swap files
 *.swp
 *~
+
+# Claude collaboration notes — project-local, not for distribution
+CLAUDE.md

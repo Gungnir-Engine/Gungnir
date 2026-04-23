@@ -1,57 +1,75 @@
-// Gungnir — a UCI chess engine
-// Session 15 demo: initialize precomputed attack tables for knight/king/pawn,
-// print a few sanity bitboards, and exit. No movegen yet (that's Session 16).
+// Gungnir — session 16 driver.
+// Usage:
+//   gungnir                          → perft(4) from startpos
+//   gungnir perft <depth>            → perft depth from startpos
+//   gungnir perft <depth> <fen...>   → perft depth from given FEN
+//   gungnir divide <depth> [fen...]  → divide (per-move) perft
 
 #include "attacks.h"
-#include "bitboard.h"
-#include "types.h"
+#include "perft.h"
+#include "position.h"
 
+#include <cstring>
 #include <iostream>
+#include <sstream>
+#include <string>
 
 namespace gungnir {
-
 constexpr const char* kVersion = "0.1.0-dev";
-
 void print_banner() {
     std::cout << "Gungnir v" << kVersion << " — a UCI chess engine\n";
-    std::cout << "Session 15: bitboards, types, non-slider attack tables.\n\n";
+    std::cout << "Session 16: sliders via PEXT, Move, Position, movegen, perft.\n\n";
 }
-
 }  // namespace gungnir
 
-int main() {
-    using namespace gungnir;
+static std::string join_args(int argc, char** argv, int start) {
+    std::string s;
+    for (int i = start; i < argc; ++i) {
+        if (!s.empty()) s += ' ';
+        s += argv[i];
+    }
+    return s;
+}
 
+int main(int argc, char** argv) {
+    using namespace gungnir;
     init_attacks();
     print_banner();
 
-    std::cout << "Knight attacks from e4:\n";
-    std::cout << bitboard_to_string(knight_attacks(SQ_E4)) << "\n";
+    Position pos;
 
-    std::cout << "King attacks from d4:\n";
-    std::cout << bitboard_to_string(king_attacks(SQ_D4)) << "\n";
+    // Parse args
+    std::string mode = "perft";
+    int depth = 4;
+    std::string fen;
 
-    std::cout << "White pawn attacks from e4:\n";
-    std::cout << bitboard_to_string(pawn_attacks(WHITE, SQ_E4)) << "\n";
+    if (argc >= 2) {
+        mode = argv[1];
+        if (argc >= 3) {
+            try { depth = std::stoi(argv[2]); } catch (...) { depth = 4; }
+        }
+        if (argc >= 4) {
+            fen = join_args(argc, argv, 3);
+        }
+    }
 
-    std::cout << "Black pawn attacks from e4:\n";
-    std::cout << bitboard_to_string(pawn_attacks(BLACK, SQ_E4)) << "\n";
+    if (fen.empty()) pos.set_startpos();
+    else if (!pos.set_from_fen(fen)) {
+        std::cerr << "Invalid FEN.\n";
+        return 1;
+    }
 
-    // Quick structural sanity:
-    //   - Knight on e4 attacks 8 squares (in-board)
-    //   - Knight on a1 attacks 2 squares (corner)
-    //   - King on e1 attacks 5 squares (on the edge, including e2, d1, f1, d2, f2)
-    std::cout << "Sanity counts:\n";
-    std::cout << "  knight_attacks(e4) popcount = " << popcount(knight_attacks(SQ_E4))
-              << " (expect 8)\n";
-    std::cout << "  knight_attacks(a1) popcount = " << popcount(knight_attacks(SQ_A1))
-              << " (expect 2)\n";
-    std::cout << "  king_attacks(e1) popcount   = " << popcount(king_attacks(SQ_E1))
-              << " (expect 5)\n";
-    std::cout << "  pawn_attacks(W, e2) popcount = " << popcount(pawn_attacks(WHITE, SQ_E2))
-              << " (expect 2)\n";
-    std::cout << "  pawn_attacks(W, a2) popcount = " << popcount(pawn_attacks(WHITE, SQ_A2))
-              << " (expect 1)\n";
+    std::cout << pos.to_string() << "\n";
+
+    if (mode == "divide") {
+        perft_divide(pos, depth);
+    } else {
+        // Plain perft — print the count per depth from 1..depth
+        for (int d = 1; d <= depth; ++d) {
+            const u64 n = perft(pos, d);
+            std::cout << "perft(" << d << ") = " << n << "\n";
+        }
+    }
 
     return 0;
 }
