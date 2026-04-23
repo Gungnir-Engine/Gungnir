@@ -46,3 +46,8 @@ data/
 *.bin
 *.jsonl
 *.jsonl.zst
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
