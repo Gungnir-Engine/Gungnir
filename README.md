@@ -3,11 +3,9 @@
 A UCI chess engine in C++, targeting **~3300–3500 Elo**.
 
 Built from scratch as a learning project. Evaluation uses a HalfKAv2_hm
-neural network — a feature-bucketed architecture pioneered by the Stockfish
-project and widely adopted in computer chess — implemented here in
-independent C++. Weights are trained from scratch on CC0-licensed position
-data; Gungnir does **not** ship or depend on any GPL-licensed weights or
-source code.
+neural network — a feature-bucketed architecture widely adopted in computer
+chess — with an independent C++ implementation. Weights are trained on
+public chess position data.
 
 ## Building
 
@@ -30,17 +28,17 @@ The binary lands at `build/Release/gungnir.exe` (Windows) or `build/gungnir` (Un
 ./build/Release/gungnir.exe
 ```
 
-Without a NNUE weights file the engine uses its classical PeSTO evaluation
-(~2300 Elo). To use a compatible NNUE, either drop a `gungnir.nnue` file
-beside the executable (auto-loads) or via UCI:
+Without a weights file the engine uses its classical PeSTO evaluation
+(~2300 Elo). To load a compatible NNUE, either drop a `gungnir.nnue` beside
+the executable (auto-loads) or via UCI:
 
 ```
 setoption name NNUEFile value path/to/your.nnue
 ```
 
 Training your own weights: see [`tools/README.md`](tools/README.md) for the
-CC0-licensed data pipeline (Lichess evaluation database → labels → PyTorch
-trainer → serialized `.nnue`).
+data pipeline (public evaluation database → labels → PyTorch trainer →
+serialized `.nnue`).
 
 ## Roadmap
 
@@ -53,16 +51,14 @@ trainer → serialized `.nnue`).
 | v0.4   | ✅ HalfKAv2_hm NNUE loader + forward pass + incremental accumulator + AVX2 SIMD |
 | v0.5   | ✅ Search refinements (LMR, LMP, futility, PVS, singular extensions, cont/cap history) |
 | v0.6   | ✅ LazySMP multi-threading |
-| v0.7   | 🚧 Custom-trained weights (CC0 pipeline) |
+| v0.7   | 🚧 Custom-trained weights pipeline |
 | v1.0   | Tuned, SPRT-validated, competitive |
 
 ## Testing
 
-[fastchess](https://github.com/Disservin/fastchess) (MIT licensed) is used
-for engine-vs-engine matches and SPRT. It's an external tool — not bundled
-with Gungnir.
+[fastchess](https://github.com/Disservin/fastchess) is used for engine-vs-
+engine matches and SPRT.
 
 ## License
 
-Copyright (c) 2026 Gungnir-Engine. All rights reserved. (License TBD —
-deliberately keeping options open until weights are fully independent.)
+Copyright (c) 2026 Gungnir-Engine. All rights reserved.
