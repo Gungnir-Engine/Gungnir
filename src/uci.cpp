@@ -113,7 +113,7 @@ int uci_loop() {
             std::cout << "option name Hash type spin default 16 min 1 max 1024" << std::endl;
             std::cout << "option name Threads type spin default 1 min 1 max 64" << std::endl;
             std::cout << "option name UseNNUE type check default true" << std::endl;
-            std::cout << "option name NNUEFile type string default nn-small.nnue" << std::endl;
+            std::cout << "option name NNUEFile type string default <empty>" << std::endl;
             std::cout << "uciok" << std::endl;
         } else if (token == "setoption") {
             // setoption name <name> value <value>

@@ -110,15 +110,18 @@ static int run_bench(int depth) {
     return 0;
 }
 
-// Try to auto-load nn-small.nnue from a few standard locations.
-// Returns true if loaded.
+// Try to auto-load a user-provided .nnue from a few standard locations.
+// Returns true if loaded. We intentionally do NOT include any Stockfish-
+// distributed weights paths here — those are GPL v3. Users who want to try
+// the engine with SF weights can load them explicitly via UCI:
+//     setoption name NNUEFile value /path/to/your.nnue
+// Without NNUE, the engine uses the classical PeSTO eval (Sessions 18-20).
 static bool try_auto_load_nnue() {
     using namespace gungnir;
     static const char* kCandidates[] = {
-        "nn-small.nnue",                     // CWD
-        "../nn-small.nnue",                  // build/Release/ → build/
-        "../../nn-small.nnue",               // build/Release/ → repo root
-        "E:/Claude/nn-small.nnue",           // hardcoded fallback
+        "gungnir.nnue",                      // our own trained net (future)
+        "../gungnir.nnue",                   // build/Release/ → build/
+        "../../gungnir.nnue",                // build/Release/ → repo root
     };
     for (const char* path : kCandidates) {
         if (NNUE::load(path)) return true;
@@ -156,19 +159,72 @@ int main(int argc, char** argv) {
         return run_bench(depth);
     }
 
+    // `gungnir labelfens <in.txt> <out.txt> [depth=12]`
+    // Self-labels FENs with Gungnir's own evaluation. No GPL dependency. Output
+    // format matches what tools/train_nnue.py expects: one "FEN|score" per line,
+    // score in centipawns from white's POV. Positions where Gungnir finds a mate
+    // get encoded as ±(30000 − plies-to-mate).
+    //
+    // Caveat: a net trained on Gungnir labels cannot exceed Gungnir's own
+    // strength. For stronger teachers see tools/README.md (Lichess CC0 eval DB).
+    if (mode == "labelfens") {
+        print_banner();
+        if (argc < 4) {
+            std::cerr << "Usage: gungnir labelfens <in.txt> <out.txt> [depth=12]\n";
+            return 1;
+        }
+        const std::string in_path = argv[2];
+        const std::string out_path = argv[3];
+        int sdepth = 12;
+        if (argc >= 5) try { sdepth = std::stoi(argv[4]); } catch (...) {}
+
+        std::ifstream in(in_path);
+        if (!in) { std::cerr << "Cannot open " << in_path << "\n"; return 1; }
+        std::ofstream out(out_path);
+        if (!out) { std::cerr << "Cannot open " << out_path << "\n"; return 1; }
+
+        TT::init(16);
+        Position p;
+        std::string fen;
+        int n = 0, skipped = 0;
+        while (std::getline(in, fen)) {
+            if (fen.empty()) continue;
+            if (!p.set_from_fen(fen)) { ++skipped; continue; }
+            if (NNUE::is_loaded() && NNUE::is_enabled()) NNUE::refresh(p);
+            SearchInfo info = search_depth(p, sdepth);
+            // Score is STM POV; convert to white POV.
+            int cp = info.score;
+            if (p.stm() == BLACK) cp = -cp;
+            out << fen << '|' << cp << '\n';
+            ++n;
+            if (n % 500 == 0) std::cout << "  " << n << " FENs labeled\n";
+        }
+        out.close();
+        std::cout << "\nLabeled " << n << " FENs";
+        if (skipped) std::cout << " (" << skipped << " skipped)";
+        std::cout << " -> " << out_path << "\n";
+        return 0;
+    }
+
     // Session 43: distillation pipeline pointer. Prints recipe and exits.
     if (mode == "distill") {
         print_banner();
         std::cout <<
-            "NNUE distillation pipeline:\n"
+            "NNUE distillation pipeline (GPL-free):\n"
             "\n"
-            "  Step 1: gungnir genfens <num_games> fens.txt [depth=4] [random_plies=8]\n"
-            "  Step 2: python tools/label_fens.py fens.txt labels.txt --depth 12\n"
+            "  Option A (strongest teacher): use Lichess CC0 evaluation database\n"
+            "      https://database.lichess.org/#evals\n"
+            "      Extract FEN|score_cp pairs, then go to Step 3.\n"
+            "\n"
+            "  Option B (self-contained):\n"
+            "    Step 1: gungnir genfens <num_games> fens.txt [depth=4] [random_plies=8]\n"
+            "    Step 2: gungnir labelfens fens.txt labels.txt [depth=12]\n"
+            "\n"
             "  Step 3: python tools/train_nnue.py labels.txt weights.bin --epochs 10\n"
-            "          (skeleton only; for SF-format output use nnue-pytorch repo)\n"
+            "          (skeleton only; for Gungnir-loadable output, see tools/README.md)\n"
             "  Step 4: setoption name NNUEFile value path/to/your-trained.nnue   (in UCI)\n"
             "\n"
-            "See tools/README.md for full details.\n";
+            "See tools/README.md for full details and licensing notes.\n";
         return 0;
     }
 

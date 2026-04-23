@@ -1,97 +1,126 @@
-# Gungnir tools — NNUE distillation pipeline
+# Gungnir tools — NNUE distillation pipeline (GPL-free)
 
-End-to-end recipe for training a custom NNUE from Stockfish-labeled positions.
+End-to-end recipe for training a custom NNUE for Gungnir without any GPL
+dependencies in the data or the code path.
+
+## Licensing stance
+
+Gungnir deliberately avoids GPL dependencies. That means:
+- We do NOT ship or auto-load Stockfish's `.nnue` weight files (GPL v3).
+- We do NOT use Stockfish or any GPL-derived engine to label training data.
+- All training data sources listed here are either CC0 (public domain),
+  permissively licensed, or produced by Gungnir itself.
+
+Our engine code is independent of whose weights you feed it — any `.nnue`
+file matching the HalfKAv2_hm small-net format (L1=128) or big-net format
+(L1=3072) will load. But by default Gungnir runs with **classical PeSTO
+eval** (~2300 Elo) unless you provide a compatible weights file.
 
 ## Overview
 
 ```
-   ┌────────────────────┐    ┌────────────────────┐    ┌────────────────────┐
-   │  gungnir genfens   │ →  │  label_fens.py     │ →  │  train_nnue.py     │
-   │  (self-play FENs)  │    │  (Stockfish labels)│    │  (Python trainer)  │
-   └────────────────────┘    └────────────────────┘    └────────────────────┘
-       fens.txt                  labels.txt                   weights.bin
+┌──────────────────────────┐   ┌──────────────────────────┐   ┌──────────────────────────┐
+│ Positions (FEN list)     │ → │ Labels (FEN | score cp)  │ → │ Trained weights (.nnue)  │
+│  - gungnir genfens       │   │  - gungnir labelfens     │   │  - tools/train_nnue.py   │
+│  - OR Lichess CC0 DB     │   │  - OR Lichess CC0 DB     │   │  - OR nnue-pytorch repo  │
+└──────────────────────────┘   └──────────────────────────┘   └──────────────────────────┘
 ```
 
-## Requirements
+## Data sources
 
-- Stockfish binary (for labelling). Default path is hardcoded to
-  `E:\Claude\stockfish\stockfish\stockfish-windows-x86-64-avx2.exe`.
-  Override with `--sf <path>` on `label_fens.py`.
-- Python 3.9+ with PyTorch (`pip install torch`).
-- Lots of CPU time — Stockfish at depth 12 labels ~20-40 FENs/sec.
+### Option A — Lichess evaluation database (CC0 public domain) [RECOMMENDED]
 
-## Step 1 — Generate self-play positions
+Lichess publishes millions of human-played positions with engine evaluations,
+released under CC0. Great data; no license concerns since CC0 is a deliberate
+waiver. Download from:
 
+> https://database.lichess.org/#evals
+
+The file format is a JSONL-like archive. Each line has a FEN plus evaluations
+at multiple depths. Extract the FEN and the deepest eval per line to produce
+our `FEN|score_cp` format. A simple `jq` or Python script handles this.
+
+Recommended volume for meaningful training: 1M+ positions.
+
+### Option B — Gungnir self-labels
+
+Weaker but fully self-contained. Run our own engine over a FEN list at high
+depth:
+
+```
+gungnir labelfens fens.txt labels.txt 12
+```
+
+Ceiling for a net trained on Gungnir labels is Gungnir's own strength (student
+can't exceed teacher). With classical-only Gungnir (~2300 Elo), the trained
+net will plateau there. Still a useful exercise, and a fine way to smoke-test
+the training pipeline end-to-end before moving to Option A for real.
+
+### Option C — Game outcomes only (no engine-derived labels)
+
+Use PGN game results (1/0/½) as training targets. Much weaker signal than
+engine evals, slower convergence, but most aligned with the "no GPL anywhere"
+stance if that matters.
+
+## Steps
+
+### 1. Generate or download positions
+
+Option A: download Lichess CC0 evals (has both positions and labels — skip to step 3).
+
+Option B: self-play:
 ```
 gungnir genfens 500 fens.txt 4 8
 ```
+500 self-play games at depth 4, 8 random opening plies. Produces ~30k FENs.
 
-Plays 500 self-play games at search depth 4 with 8 random opening plies for
-diversity. Writes one FEN per ply visited. A 500-game run produces roughly
-30,000-50,000 unique positions.
-
-## Step 2 — Label positions with Stockfish
+### 2. Label positions (if not already labeled)
 
 ```
-python tools/label_fens.py fens.txt labels.txt --depth 12
+gungnir labelfens fens.txt labels.txt 12
 ```
 
-For each FEN, runs `stockfish go depth 12` and writes a `FEN|score_cp` line.
-Score is in centipawns from white's POV. Mate scores encoded as ±(30000 −
-mate_distance). Throughput roughly 20-40 positions per second per CPU core
-at depth 12.
+At depth 12, throughput is roughly 50-100 positions/sec on a single core.
+100k positions ≈ 15-30 minutes.
 
-For a meaningful training run, target at least **100,000 labeled positions**
-(~1 hour at depth 12 on a single core; faster with multiple Stockfish processes).
-
-## Step 3 — Train
+### 3. Train
 
 ```
-python tools/train_nnue.py labels.txt weights.bin --epochs 10 --lr 1e-3
+python tools/train_nnue.py labels.txt weights.bin --epochs 10
 ```
 
-**This script is a SKELETON / REFERENCE**, not a working SF-quality trainer.
-It implements:
+**Current state: this script is a SKELETON.** It trains a 768-input
+PieceSquare net (NOT HalfKAv2_hm), outputs raw float32 weights that Gungnir's
+loader does NOT currently consume. Use it to understand the training-loop
+shape.
 
-- **Architecture**: 768 (PieceSquare) → 256 → 32 → 1 with clipped ReLU.
-  Much simpler than HalfKAv2_hm. Will NOT produce SF-grade output.
-- **Loss**: Texel-style MSE on `sigmoid(score / 400)`.
-- **Optimizer**: Adam.
+For weights Gungnir can load:
+- You can either write a conversion script (raw float32 → `.nnue` binary
+  format matching SF small-net layout), OR
+- Fork and adapt `nnue-pytorch` (GPL v3 — tool only, output weights are
+  yours) locally to produce HalfKAv2_hm output. Keep the trained weights
+  out of your repo / distribute under your own terms.
 
-The output `weights.bin` is raw float32, NOT a `.nnue` file Gungnir's loader
-can consume directly. Wiring it into Gungnir would require either:
-- Adding a "trained-by-us" weight-load path alongside the SF .nnue path, or
-- Converting these weights into the SF .nnue format (non-trivial — different
-  arch, quantization to int8/int16, byte layout).
+### 4. Use
 
-## Going further — actual SF NNUE training
-
-For a `.nnue` file Gungnir can load directly (HalfKAv2_hm, L1=128, all the
-SF quantization), use the official Stockfish PyTorch trainer:
-
-```
-git clone https://github.com/official-stockfish/nnue-pytorch
-cd nnue-pytorch
-pip install -r requirements.txt
-# Convert our labels.txt to the .binpack format expected by nnue-pytorch
-# (see their README for the conversion scripts).
-python train.py --features=HalfKAv2_hm ...
-```
-
-This produces an actual `.nnue` that drops in via:
 ```
 gungnir
 > setoption name NNUEFile value path/to/your-trained.nnue
+> position startpos
+> go depth 10
 ```
 
-Realistic scope: SF's own training takes billions of positions and weeks of
-GPU time. A modest distillation run on 100k-1M positions can still produce
-a usable net but will be substantially weaker than `nn-small.nnue`.
+Or drop the file at `Gungnir/gungnir.nnue` for auto-load on startup.
 
 ## File reference
 
-| File                  | Purpose                                              |
-| --------------------- | ---------------------------------------------------- |
-| `label_fens.py`       | Labels FEN positions with Stockfish evaluations.     |
-| `train_nnue.py`       | Reference PyTorch trainer (NOT SF-format output).    |
-| `README.md`           | This file.                                           |
+| File                  | Purpose                                                     |
+| --------------------- | ----------------------------------------------------------- |
+| `train_nnue.py`       | PyTorch reference trainer (768 features, not HalfKAv2_hm).  |
+| `README.md`           | This file.                                                  |
+
+## Note on the previous `label_fens.py`
+
+An earlier version of this directory included `label_fens.py` that invoked
+Stockfish as the labeller. That's been removed to keep the pipeline
+GPL-free. The `gungnir labelfens` CLI mode replaces it.
