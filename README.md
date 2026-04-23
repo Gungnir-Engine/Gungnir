@@ -59,6 +59,11 @@ serialized `.nnue`).
 [fastchess](https://github.com/Disservin/fastchess) is used for engine-vs-
 engine matches and SPRT.
 
+## Acknowledgements
+
+This project was built using [Claude Code](https://claude.com/claude-code)
+running Anthropic's Claude Opus 4.7 model.
+
 ## License
 
 Copyright (c) 2026 Gungnir-Engine. All rights reserved.
