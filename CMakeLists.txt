@@ -24,6 +24,8 @@ endif()
 
 add_executable(gungnir
     src/main.cpp
+    src/bitboard.cpp
+    src/attacks.cpp
 )
 
 target_include_directories(gungnir PRIVATE src)
