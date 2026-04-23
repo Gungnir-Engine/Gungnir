@@ -18,4 +18,9 @@ u64 perft(Position& pos, int depth);
 // Useful for bisecting movegen bugs against `stockfish divide`.
 void perft_divide(Position& pos, int depth);
 
+// Like perft, but at every make/unmake verifies that the incrementally-
+// maintained Zobrist hash matches a from-scratch recomputation, AND that
+// unmake restores the previous hash. Aborts on any mismatch with a diagnostic.
+u64 perft_hashed(Position& pos, int depth);
+
 }  // namespace gungnir

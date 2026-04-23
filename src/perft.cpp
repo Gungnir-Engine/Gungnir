@@ -1,9 +1,11 @@
 #include "perft.h"
 
 #include "movegen.h"
+#include "notation.h"
 #include "position.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 
@@ -26,24 +28,37 @@ u64 perft(Position& pos, int depth) {
     return total;
 }
 
-static std::string move_to_uci(Move m) {
-    auto sq_name = [](Square s) {
-        std::string out;
-        out += char('a' + file_of(s));
-        out += char('1' + rank_of(s));
-        return out;
-    };
-    std::string r = sq_name(m.from()) + sq_name(m.to());
-    if (m.type() == MT_PROMOTION) {
-        switch (m.promo_type()) {
-            case KNIGHT: r += 'n'; break;
-            case BISHOP: r += 'b'; break;
-            case ROOK:   r += 'r'; break;
-            case QUEEN:  r += 'q'; break;
-            default: break;
+u64 perft_hashed(Position& pos, int depth) {
+    if (depth == 0) return 1;
+
+    MoveList list;
+    generate_legal(pos, list);
+
+    u64 total = 0;
+    for (int i = 0; i < list.size; ++i) {
+        const Move m = list.moves[i];
+        const u64 hash_before = pos.hash();
+
+        pos.make_move(m);
+        const u64 expected_after = pos.compute_hash_from_scratch();
+        if (pos.hash() != expected_after) {
+            std::cerr << "HASH MISMATCH after make: " << move_to_uci(m) << "\n";
+            std::cerr << "  Got:      0x" << std::hex << pos.hash() << "\n";
+            std::cerr << "  Expected: 0x" << expected_after << std::dec << "\n";
+            std::abort();
+        }
+
+        total += perft_hashed(pos, depth - 1);
+
+        pos.unmake_move(m);
+        if (pos.hash() != hash_before) {
+            std::cerr << "HASH MISMATCH after unmake: " << move_to_uci(m) << "\n";
+            std::cerr << "  Got:      0x" << std::hex << pos.hash() << "\n";
+            std::cerr << "  Expected: 0x" << hash_before << std::dec << "\n";
+            std::abort();
         }
     }
-    return r;
+    return total;
 }
 
 void perft_divide(Position& pos, int depth) {

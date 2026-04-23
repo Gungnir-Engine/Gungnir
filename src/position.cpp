@@ -58,7 +58,7 @@ void Position::clear() {
     occupancy_[WHITE] = occupancy_[BLACK] = 0;
     stm_ = WHITE;
     fullmove_ = 1;
-    state_ = StateInfo{NO_CASTLING, SQ_NONE, 0, NO_PIECE};
+    state_ = StateInfo{0, NO_CASTLING, SQ_NONE, 0, NO_PIECE};
     history_size_ = 0;
 }
 
@@ -181,7 +181,37 @@ bool Position::set_from_fen(std::string_view fen) {
     state_.captured = NO_PIECE;
     fullmove_ = fm;
     history_size_ = 0;
+    state_.hash = compute_hash_from_scratch();
     return true;
+}
+
+u64 Position::compute_hash_from_scratch() const {
+    u64 h = 0;
+    for (Square s = SQ_A1; s < SQ_NONE; ++s) {
+        const Piece p = board_[s];
+        if (p != NO_PIECE) h ^= Zobrist::psq[p][s];
+    }
+    h ^= Zobrist::castling[state_.castling];
+    if (state_.ep_square != SQ_NONE) {
+        h ^= Zobrist::enpassant[file_of(state_.ep_square)];
+    }
+    if (stm_ == BLACK) h ^= Zobrist::side;
+    return h;
+}
+
+bool Position::is_threefold_repetition() const {
+    // Two prior occurrences (plus the current one) = threefold.
+    // Positions can only repeat with the same side to move, so step by 2 plies.
+    // The halfmove clock resets on captures + pawn moves, both of which
+    // permanently alter material/structure — so no repetition can reach further
+    // back than `halfmove` plies.
+    int matches = 0;
+    for (int back = 4; back <= state_.halfmove && back <= history_size_; back += 2) {
+        if (history_[history_size_ - back].hash == state_.hash) {
+            if (++matches >= 2) return true;
+        }
+    }
+    return false;
 }
 
 std::string Position::fen() const {
@@ -229,7 +259,7 @@ std::string Position::to_string() const {
 
 void Position::make_move(Move m) {
     assert(history_size_ < 1024);
-    history_[history_size_++] = state_;  // save reversible state
+    history_[history_size_++] = state_;  // save reversible state for unmake
 
     const Square from = m.from();
     const Square to = m.to();
@@ -241,12 +271,24 @@ void Position::make_move(Move m) {
 
     Piece captured = NO_PIECE;
 
+    // --- Hash: XOR out the OLD ep + castling bits before any state mutation.
+    // We'll XOR in the NEW values after the state is updated below, and toggle
+    // `side` once at the end. Piece-on-square XORs happen alongside their
+    // respective move-type branches.
+    u64 h = state_.hash;
+    if (state_.ep_square != SQ_NONE) {
+        h ^= Zobrist::enpassant[file_of(state_.ep_square)];
+    }
+    h ^= Zobrist::castling[state_.castling];
+
     if (mt == MT_EN_PASSANT) {
         // Pawn captures the pawn behind the ep target square.
         const Square cap_sq = Square(int(to) + (us == WHITE ? -8 : 8));
         captured = board_[cap_sq];
         remove_piece(cap_sq);
         move_piece(from, to);
+        h ^= Zobrist::psq[moving][from] ^ Zobrist::psq[moving][to];
+        h ^= Zobrist::psq[captured][cap_sq];
     } else if (mt == MT_CASTLING) {
         // to square is the king's destination; we also move the rook.
         // Determine rook squares by the king's final square.
@@ -255,19 +297,27 @@ void Position::make_move(Move m) {
         else if (to == SQ_C1) { rook_from = SQ_A1; rook_to = SQ_D1; }
         else if (to == SQ_G8) { rook_from = SQ_H8; rook_to = SQ_F8; }
         else { rook_from = SQ_A8; rook_to = SQ_D8; }
+        const Piece rook = board_[rook_from];
         move_piece(from, to);
         move_piece(rook_from, rook_to);
+        h ^= Zobrist::psq[moving][from] ^ Zobrist::psq[moving][to];
+        h ^= Zobrist::psq[rook][rook_from] ^ Zobrist::psq[rook][rook_to];
     } else {
         // Normal move or promotion.
         if (board_[to] != NO_PIECE) {
             captured = board_[to];
             remove_piece(to);
+            h ^= Zobrist::psq[captured][to];
         }
         if (mt == MT_PROMOTION) {
+            const Piece promoted = make_piece(us, m.promo_type());
             remove_piece(from);
-            put_piece(make_piece(us, m.promo_type()), to);
+            put_piece(promoted, to);
+            h ^= Zobrist::psq[moving][from];
+            h ^= Zobrist::psq[promoted][to];
         } else {
             move_piece(from, to);
+            h ^= Zobrist::psq[moving][from] ^ Zobrist::psq[moving][to];
         }
     }
 
@@ -288,6 +338,14 @@ void Position::make_move(Move m) {
     }
 
     state_.captured = captured;
+
+    // --- Hash: XOR in the NEW ep + castling bits, and toggle side.
+    h ^= Zobrist::castling[state_.castling];
+    if (state_.ep_square != SQ_NONE) {
+        h ^= Zobrist::enpassant[file_of(state_.ep_square)];
+    }
+    h ^= Zobrist::side;
+    state_.hash = h;
 
     // Fullmove: increment after black's move.
     if (us == BLACK) ++fullmove_;

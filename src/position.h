@@ -1,15 +1,15 @@
 // Gungnir — Position: full chess game state.
 // Represents the board via 12 piece-bitboards + per-color + all-pieces bitboards,
 // plus metadata (side to move, castling rights, en passant target, halfmove
-// clock, fullmove number). Handles FEN parse/serialize, make/unmake moves,
-// and "is king in check" helper.
-//
-// Zobrist hashing is Session 17.
+// clock, fullmove number, Zobrist hash). Handles FEN parse/serialize,
+// make/unmake moves with incremental hash updates, in-check + threefold-
+// repetition queries.
 
 #pragma once
 
 #include "move.h"
 #include "bitboard.h"
+#include "zobrist.h"
 
 #include <string>
 #include <string_view>
@@ -28,12 +28,13 @@ enum CastlingRights : u8 {
 
 // StateInfo holds the "reversible" parts of position state needed to undo a move.
 // Pushed onto Position's undo stack on make_move, popped on unmake_move.
+// `hash` is included so repetition detection can scan prior positions in O(1).
 struct StateInfo {
+    u64    hash;            // Zobrist hash of THIS position
     u8     castling;
     Square ep_square;       // SQ_NONE if no ep available
     int    halfmove;
     Piece  captured;        // NO_PIECE if the move wasn't a capture
-    // (Zobrist hash goes here once we add it in Session 17.)
 };
 
 class Position {
@@ -75,6 +76,19 @@ public:
 
     // True if the side-to-move's king is in check.
     bool in_check() const;
+
+    // Zobrist hash of the current position. Maintained incrementally by
+    // make_move / unmake_move.
+    u64 hash() const { return state_.hash; }
+
+    // Recompute the Zobrist hash by walking every square + state field.
+    // Used by perft_hashed to verify the incremental update is correct.
+    u64 compute_hash_from_scratch() const;
+
+    // True if the current position has occurred at least 3 times in the game
+    // (counting the current position). Walks back through history_, bounded by
+    // the halfmove clock (no repetition can cross an irreversible move).
+    bool is_threefold_repetition() const;
 
 private:
     // Internal helpers
