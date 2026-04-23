@@ -38,3 +38,11 @@ desktop.ini
 
 # Claude collaboration notes — project-local, not for distribution
 CLAUDE.md
+
+# Training data (Lichess CC0 database, extracted labels, etc.) — huge files,
+# not for version control.
+data/
+*.nnue
+*.bin
+*.jsonl
+*.jsonl.zst
