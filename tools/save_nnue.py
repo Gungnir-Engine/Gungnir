@@ -149,12 +149,13 @@ def main():
         fc2_b_all = [np.zeros_like(b) for b in fc2_b_all]
 
     # --- Quantize ---
-    ft_biases_q  = quant_i16(ft_b, QA).tolist()
-    # row-major flatten: weight[feat, unit] -> weight[feat*128 + unit] per C++ loader
-    ft_weights_q = quant_i16(ft_w, QA).flatten(order='C').tolist()
-    # PSQT scaled by QA. Lives in int32.
+    # Session 48: with QAT, the trained float weights ARE int values (round
+    # and clip, no additional scaling). This matches the training forward
+    # pass which called fake_quant(round-STE) on the weights before use.
+    ft_biases_q  = quant_i16(ft_b, 1.0).tolist()
+    ft_weights_q = quant_i16(ft_w, 1.0).flatten(order='C').tolist()
     psqt_flat    = psqt_w.flatten(order='C')
-    psqt_q       = quant_i32(psqt_flat, QA).tolist()
+    psqt_q       = quant_i32(psqt_flat, 1.0).tolist()
 
     # Layer stacks — raw little-endian bytes
     stacks_bytes = bytearray()
@@ -162,22 +163,22 @@ def main():
         stacks_bytes += struct.pack('<I', 0)    # stack hash (our loader ignores the value)
 
         # fc_0: 16 int32 biases, then 16*128 int8 weights
-        fc0_b_q = quant_i32(fc0_b_all[i], QA * QB)
-        fc0_w_q = quant_i8 (fc0_w_all[i], QB)
+        fc0_b_q = quant_i32(fc0_b_all[i], 1.0)
+        fc0_w_q = quant_i8 (fc0_w_all[i], 1.0)
         for b in fc0_b_q:
             stacks_bytes += struct.pack('<i', int(b))
         stacks_bytes += fc0_w_q.tobytes()        # shape [16, 128] row-major
 
         # fc_1: 32 int32 biases, 32*32 int8 weights
-        fc1_b_q = quant_i32(fc1_b_all[i], QA * QB)
-        fc1_w_q = quant_i8 (fc1_w_all[i], QB)
+        fc1_b_q = quant_i32(fc1_b_all[i], 1.0)
+        fc1_w_q = quant_i8 (fc1_w_all[i], 1.0)
         for b in fc1_b_q:
             stacks_bytes += struct.pack('<i', int(b))
         stacks_bytes += fc1_w_q.tobytes()
 
         # fc_2: 1 int32 bias, 32 int8 weights
-        fc2_b_q = quant_i32(fc2_b_all[i], QA * QB)
-        fc2_w_q = quant_i8 (fc2_w_all[i], QB)
+        fc2_b_q = quant_i32(fc2_b_all[i], 1.0)
+        fc2_w_q = quant_i8 (fc2_w_all[i], 1.0)
         stacks_bytes += struct.pack('<i', int(fc2_b_q[0]))
         stacks_bytes += fc2_w_q.tobytes()
 

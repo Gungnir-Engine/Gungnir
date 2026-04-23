@@ -33,8 +33,47 @@ from gungnir_nnue import (
 
 
 # ============================================================================
-# Model — HalfKAv2_hm forward pass in float32
+# Model — HalfKAv2_hm forward pass in float32, with Quantization-Aware
+# Training (Session 48): the forward pass simulates the int arithmetic that
+# src/nnue.cpp does. Weights are fake-quantized via STE so they learn to
+# survive the int round-trip.
+#
+# SF's small-net scheme: QA=255 for FT (int16 storage), QB=64 for layer
+# weights (int8 storage). Accumulator values are clamped at 127, which
+# (after divide by QA=255) corresponds to float ~0.498. The forward pass
+# works in "int-activation space" — i.e., weights and biases are stored as
+# floats but represent their int-scaled values directly. So FT bias 40
+# (float) "is" int16 value 40, representing float 40/255 ≈ 0.157 in SF's
+# natural scale.
 # ============================================================================
+
+QA = 255.0      # FT quantization scale (int16 storage)
+QB = 64.0       # layer quantization scale (int8 storage)
+
+
+class _RoundSTE(torch.autograd.Function):
+    """Round with a straight-through estimator: forward rounds, backward is identity."""
+    @staticmethod
+    def forward(ctx, x):
+        return torch.round(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
+def round_ste(x):
+    return _RoundSTE.apply(x)
+
+
+def fake_quant(w, bits):
+    """Apply fake integer quantization with STE: round to nearest int, clip to
+    [-2^(bits-1), 2^(bits-1)-1]. Forward pass uses the quantized value;
+    backward pass treats round as identity so gradients flow."""
+    qmax = (1 << (bits - 1)) - 1
+    qmin = -(1 << (bits - 1))
+    return torch.clamp(round_ste(w), qmin, qmax)
+
 
 class GungnirHalfKA(nn.Module):
     def __init__(self):
@@ -50,17 +89,20 @@ class GungnirHalfKA(nn.Module):
         self.fc1 = nn.ModuleList([nn.Linear(FC1_IN_PAD, FC1_OUT) for _ in range(LAYER_STACKS)])
         self.fc2 = nn.ModuleList([nn.Linear(FC2_IN_PAD, 1) for _ in range(LAYER_STACKS)])
 
-        # Init: FT weights small but nonzero, FT bias offset so accumulator
-        # starts in the linear regime of the [0, 127] clamp (not saturated,
-        # not dead). Without this offset, near-zero accumulator makes the
-        # pairwise transform `clamp(a,0,127)*clamp(b,0,127)/128` produce
-        # zero gradients early in training.
-        nn.init.normal_(self.ft.weight, mean=0.0, std=1.0)
-        nn.init.constant_(self.ft_bias, 40.0)
+        # Init for QAT: values stored as floats but representing int16/int8.
+        # Magnitudes chosen so fc_0 outputs typical ~1000-2000 — small enough
+        # that sqr-clipped-relu (>>19) and clipped-relu (>>6) produce useful
+        # values 2-30, not saturating at 127 and not rounding to 0.
+        #
+        # FT weights std=5 → rounded int16 values ±5-15 typical.
+        # FT bias=30 → keeps accumulator in [0, 127] clamp range.
+        # Layer weights std=3 → rounded int8 values ±2-9.
+        nn.init.normal_(self.ft.weight, mean=0.0, std=5.0)
+        nn.init.constant_(self.ft_bias, 30.0)
         nn.init.zeros_(self.psqt.weight)
         for stack in (self.fc0, self.fc1, self.fc2):
             for lin in stack:
-                nn.init.kaiming_uniform_(lin.weight, a=5**0.5)
+                nn.init.normal_(lin.weight, mean=0.0, std=3.0)
                 nn.init.zeros_(lin.bias)
 
     def forward(self, w_feats, w_offsets, b_feats, b_offsets, stm, bucket):
@@ -73,10 +115,33 @@ class GungnirHalfKA(nn.Module):
         """
         B = stm.shape[0]
 
-        acc_w = self.ft(w_feats, w_offsets) + self.ft_bias          # [B, 128]
-        acc_b = self.ft(b_feats, b_offsets) + self.ft_bias          # [B, 128]
-        psqt_w = self.psqt(w_feats, w_offsets)                       # [B, 8]
-        psqt_b = self.psqt(b_feats, b_offsets)                       # [B, 8]
+        # --- QAT: fake-quantize FT weights/bias and PSQT weights to int16 ---
+        # (Since EmbeddingBag doesn't let us swap weights on the fly, we
+        # compute the accumulator manually using gather + sum on quantized
+        # weights. Slower per-batch but gives us the QAT guarantee.)
+        ft_weight_q = fake_quant(self.ft.weight, 16)           # [22528, 128] int16-valued floats
+        ft_bias_q   = fake_quant(self.ft_bias,   16)           # [128]
+        psqt_w_q    = fake_quant(self.psqt.weight, 32)         # [22528, 8] int32
+
+        def sparse_sum(w, feats, offsets):
+            """Sum rows of w at indices feats, grouped into samples by offsets."""
+            # offsets: [B], feats: [total_feats].
+            # Build a segment-id for each feature (which sample it belongs to).
+            gathered = w[feats]                                # [total_feats, D]
+            # Create sample index per feature.
+            n = feats.shape[0]
+            sample_ids = torch.zeros(n, dtype=torch.long, device=feats.device)
+            if len(offsets) > 1:
+                sample_ids[offsets[1:]] = 1
+                sample_ids = sample_ids.cumsum(0)
+            out = torch.zeros(B, w.shape[1], device=w.device, dtype=w.dtype)
+            out.index_add_(0, sample_ids, gathered)
+            return out
+
+        acc_w = sparse_sum(ft_weight_q, w_feats, w_offsets) + ft_bias_q    # [B, 128]
+        acc_b = sparse_sum(ft_weight_q, b_feats, b_offsets) + ft_bias_q    # [B, 128]
+        psqt_w = sparse_sum(psqt_w_q,  w_feats, w_offsets)                  # [B, 8]
+        psqt_b = sparse_sum(psqt_w_q,  b_feats, b_offsets)                  # [B, 8]
 
         # STM perspective first, opponent second.
         stm_f = stm.float().unsqueeze(-1)                           # [B, 1]
@@ -106,7 +171,16 @@ class GungnirHalfKA(nn.Module):
                 continue
             idx = mask.nonzero(as_tuple=True)[0]
             x = ft[idx]                                              # [Bk, 128]
-            o0 = self.fc0[bk](x)                                     # [Bk, 16]
+
+            # Fake-quantize layer weights to int8.
+            fc0_w_q = fake_quant(self.fc0[bk].weight, 8)
+            fc0_b_q = fake_quant(self.fc0[bk].bias, 32)              # int32 (QA*QB scale)
+            fc1_w_q = fake_quant(self.fc1[bk].weight, 8)
+            fc1_b_q = fake_quant(self.fc1[bk].bias, 32)
+            fc2_w_q = fake_quant(self.fc2[bk].weight, 8)
+            fc2_b_q = fake_quant(self.fc2[bk].bias, 32)
+
+            o0 = torch.nn.functional.linear(x, fc0_w_q, fc0_b_q)     # [Bk, 16]
             fc0_out[idx] = o0
 
             # sqr-clipped-relu and clipped-relu over first L2 outputs.
@@ -118,12 +192,12 @@ class GungnirHalfKA(nn.Module):
             ], dim=-1)                                               # [Bk, 32]
             fc1_in[idx] = slab
 
-            o1 = self.fc1[bk](slab)                                  # [Bk, 32]
+            o1 = torch.nn.functional.linear(slab, fc1_w_q, fc1_b_q)  # [Bk, 32]
             fc1_out[idx] = o1
             ac1 = torch.clamp(o1 / (1 << 6), 0.0, 127.0)
             fc2_in[idx] = ac1
 
-            o2 = self.fc2[bk](ac1)                                   # [Bk, 1]
+            o2 = torch.nn.functional.linear(ac1, fc2_w_q, fc2_b_q)   # [Bk, 1]
             scalar[idx] = o2
 
         # Skip connection: fc_0[:, 15] * 9600/8128
