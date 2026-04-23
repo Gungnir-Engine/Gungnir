@@ -9,6 +9,7 @@
 //   gungnir bench [depth]                → search a fixed set of positions
 
 #include "attacks.h"
+#include "movegen.h"
 #include "nnue.h"
 #include "notation.h"
 #include "perft.h"
@@ -19,7 +20,9 @@
 #include "zobrist.h"
 
 #include <chrono>
+#include <fstream>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -151,6 +154,64 @@ int main(int argc, char** argv) {
             try { depth = std::stoi(argv[2]); } catch (...) {}
         }
         return run_bench(depth);
+    }
+
+    // Session 43: FEN export for NNUE distillation.
+    // `gungnir genfens <numGames> <output.txt> [searchDepth=4] [randomPlies=8]`
+    // Plays N self-play games at the requested depth, with `randomPlies` uniformly
+    // random opening plies for diversity. Writes one position-after-each-ply per
+    // line. The output is then fed to `label_fens.py` (Stockfish labeller) and
+    // imported back into a trainer.
+    if (mode == "genfens") {
+        print_banner();
+        int num_games = 100;
+        std::string out_path = "fens.txt";
+        int sdepth = 4;
+        int random_plies = 8;
+        if (argc >= 3) try { num_games = std::stoi(argv[2]); } catch (...) {}
+        if (argc >= 4) out_path = argv[3];
+        if (argc >= 5) try { sdepth = std::stoi(argv[4]); } catch (...) {}
+        if (argc >= 6) try { random_plies = std::stoi(argv[5]); } catch (...) {}
+        std::cout << "Generating " << num_games << " games at depth " << sdepth
+                  << " with " << random_plies << " random opening plies...\n";
+
+        std::ofstream out(out_path);
+        if (!out) { std::cerr << "Cannot open " << out_path << "\n"; return 1; }
+
+        std::mt19937_64 rng{0xC0FFEE'BABEULL};
+        TT::init(8);
+        size_t total_fens = 0;
+        for (int g = 0; g < num_games; ++g) {
+            Position p; p.set_startpos();
+            // Random opening
+            for (int i = 0; i < random_plies; ++i) {
+                MoveList list; generate_legal(p, list);
+                if (list.size == 0) break;
+                p.make_move(list.moves[rng() % list.size]);
+            }
+            int plies = 0;
+            while (plies < 200) {
+                MoveList list; generate_legal(p, list);
+                if (list.size == 0) break;  // mate or stalemate
+                if (p.halfmove() >= 100) break;
+                if (p.is_threefold_repetition()) break;
+                out << p.fen() << "\n";
+                ++total_fens;
+                SearchInfo info = search_depth(p, sdepth);
+                if (info.best_move == MOVE_NULL) break;
+                p.make_move(info.best_move);
+                ++plies;
+            }
+            if ((g + 1) % 10 == 0) {
+                std::cout << "  game " << (g+1) << "/" << num_games
+                          << "  fens=" << total_fens << "\n";
+            }
+        }
+        out.close();
+        std::cout << "Wrote " << total_fens << " FENs to " << out_path << "\n";
+        std::cout << "Next: python label_fens.py " << out_path
+                  << " labels.txt --depth 12   (Stockfish labeller; see CLAUDE.md)\n";
+        return 0;
     }
 
     if (mode == "nnueverify") {

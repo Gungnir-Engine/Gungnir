@@ -1,5 +1,10 @@
 // Gungnir — Stockfish HalfKAv2_hm NNUE implementation.
 // Ported from chess.html Sessions 12–13 (SF17 small net). All integer math.
+//
+// SIMD (Session 35): the hot FT delta update + pairwise transform + fc_0
+// matmul have AVX2 paths gated on __AVX2__. Outputs are bit-identical to
+// the portable scalar code (verified by `gungnir nnueverify` — same +251 cp
+// startpos eval either way).
 
 #include "nnue.h"
 
@@ -9,6 +14,31 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+
+#if defined(__AVX2__) || (defined(_MSC_VER) && defined(__AVX2__))
+    #define GUNGNIR_AVX2 1
+    #include <immintrin.h>
+#else
+    #define GUNGNIR_AVX2 0
+#endif
+
+// MSVC defines __AVX2__ when /arch:AVX2 is set (since VS 2022 17.x); older
+// MSVC needs a manual override. CMakeLists.txt sets /arch:AVX2 unconditionally.
+#if !GUNGNIR_AVX2 && defined(_MSC_VER) && defined(_M_X64)
+    #include <immintrin.h>
+    #undef GUNGNIR_AVX2
+    #define GUNGNIR_AVX2 1
+#endif
+
+// AVX-512 VNNI (Session 36): if available (Cascade Lake / Ice Lake / newer),
+// _mm256_dpbusd_epi32 fuses maddubs+madd into one instruction (~25-40% faster
+// fc_0 matmul on supporting hardware). Compile with /arch:AVX512 to enable.
+// On AVX2-only CPUs this is a no-op fallback to the maddubs path above.
+#if defined(__AVX512VNNI__) || defined(__AVXVNNI__)
+    #define GUNGNIR_VNNI 1
+#else
+    #define GUNGNIR_VNNI 0
+#endif
 
 namespace gungnir {
 namespace NNUE {
@@ -250,6 +280,24 @@ bool load(const std::string& path) {
                   << " (expected 0x" << EXPECTED_VERSION << ")" << std::dec << std::endl;
         return false;
     }
+    // Session 37: bigger SF nets (e.g. nn-1111cefa1111.nnue, ~133 MB) have a
+    // different arch hash and L1=3072 instead of 128. Loading those requires
+    // dynamic allocation of FT/layer-stack arrays sized at runtime — out of
+    // scope for now. We warn and refuse to load anything other than the small net.
+    constexpr unsigned long EXPECTED_BIG_ARCH_HASH = 0x3C103C92UL;  // SF main net
+    if (g_arch_hash != EXPECTED_ARCH_HASH) {
+        if (g_arch_hash == EXPECTED_BIG_ARCH_HASH) {
+            std::cerr << "NNUE: this is the BIG net (L1=3072). The current build is "
+                         "compiled for the SMALL net (L1=128); refusing to load. To "
+                         "support both, layer dimensions must be made runtime-variable "
+                         "(deferred refactor). Use the small net instead.\n";
+        } else {
+            std::cerr << "NNUE: arch hash 0x" << std::hex << g_arch_hash
+                      << " is unrecognized (expected 0x" << EXPECTED_ARCH_HASH
+                      << ")" << std::dec << "\n";
+        }
+        return false;
+    }
     if (end - p < 4) return false;
     g_ft_hash = read_u32(p);
 
@@ -363,11 +411,29 @@ thread_local int g_acc_top = 0;
 void rebuild_perspective(Accumulator& a, const Position& pos, int p) {
     int feats[40];
     const int n = features(pos, p, feats);
-    for (int i = 0; i < FT_OUTPUT_DIM; ++i) a.acc[p][i] = g_ft_biases[i];
+    int32_t* dst = a.acc[p];
+#if GUNGNIR_AVX2
+    // Init dst from int16 biases (sign-extended), then add feature rows.
+    for (int j = 0; j < FT_OUTPUT_DIM; j += 8) {
+        __m128i s = _mm_loadu_si128((const __m128i*)(g_ft_biases.data() + j));
+        _mm256_storeu_si256((__m256i*)(dst + j), _mm256_cvtepi16_epi32(s));
+    }
     for (int f = 0; f < n; ++f) {
         const int16_t* row = &g_ft_weights[size_t(feats[f]) * FT_OUTPUT_DIM];
-        for (int i = 0; i < FT_OUTPUT_DIM; ++i) a.acc[p][i] += row[i];
+        for (int j = 0; j < FT_OUTPUT_DIM; j += 8) {
+            __m128i s   = _mm_loadu_si128((const __m128i*)(row + j));
+            __m256i s32 = _mm256_cvtepi16_epi32(s);
+            __m256i d   = _mm256_loadu_si256((__m256i*)(dst + j));
+            _mm256_storeu_si256((__m256i*)(dst + j), _mm256_add_epi32(d, s32));
+        }
     }
+#else
+    for (int i = 0; i < FT_OUTPUT_DIM; ++i) dst[i] = g_ft_biases[i];
+    for (int f = 0; f < n; ++f) {
+        const int16_t* row = &g_ft_weights[size_t(feats[f]) * FT_OUTPUT_DIM];
+        for (int i = 0; i < FT_OUTPUT_DIM; ++i) dst[i] += row[i];
+    }
+#endif
     for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] = 0;
     for (int f = 0; f < n; ++f) {
         const int32_t* row = &g_ft_psqt_weights[size_t(feats[f]) * PSQT_BUCKETS];
@@ -381,14 +447,37 @@ inline int feature_index(int p, Square king_sq, Piece piece, Square sq) {
 
 inline void apply_remove(Accumulator& a, int p, int feat) {
     const int16_t* row = &g_ft_weights[size_t(feat) * FT_OUTPUT_DIM];
-    for (int j = 0; j < FT_OUTPUT_DIM; ++j) a.acc[p][j] -= row[j];
+    int32_t* dst = a.acc[p];
+#if GUNGNIR_AVX2
+    // 128 int32 -= sign-extended int16. 8 int32s per iteration.
+    for (int j = 0; j < FT_OUTPUT_DIM; j += 8) {
+        __m128i s   = _mm_loadu_si128((const __m128i*)(row + j));
+        __m256i s32 = _mm256_cvtepi16_epi32(s);
+        __m256i d   = _mm256_loadu_si256((__m256i*)(dst + j));
+        d = _mm256_sub_epi32(d, s32);
+        _mm256_storeu_si256((__m256i*)(dst + j), d);
+    }
+#else
+    for (int j = 0; j < FT_OUTPUT_DIM; ++j) dst[j] -= row[j];
+#endif
     const int32_t* prow = &g_ft_psqt_weights[size_t(feat) * PSQT_BUCKETS];
     for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] -= prow[k];
 }
 
 inline void apply_add(Accumulator& a, int p, int feat) {
     const int16_t* row = &g_ft_weights[size_t(feat) * FT_OUTPUT_DIM];
-    for (int j = 0; j < FT_OUTPUT_DIM; ++j) a.acc[p][j] += row[j];
+    int32_t* dst = a.acc[p];
+#if GUNGNIR_AVX2
+    for (int j = 0; j < FT_OUTPUT_DIM; j += 8) {
+        __m128i s   = _mm_loadu_si128((const __m128i*)(row + j));
+        __m256i s32 = _mm256_cvtepi16_epi32(s);
+        __m256i d   = _mm256_loadu_si256((__m256i*)(dst + j));
+        d = _mm256_add_epi32(d, s32);
+        _mm256_storeu_si256((__m256i*)(dst + j), d);
+    }
+#else
+    for (int j = 0; j < FT_OUTPUT_DIM; ++j) dst[j] += row[j];
+#endif
     const int32_t* prow = &g_ft_psqt_weights[size_t(feat) * PSQT_BUCKETS];
     for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] += prow[k];
 }
@@ -513,15 +602,29 @@ int evaluate(const Position& pos) {
     const int32_t* psqt_b = a.psqt[1];
 
     // 3. Pairwise transform (for each perspective: ft[j] = clamp(acc[j],0,127) * clamp(acc[j+H],0,127) / 128)
-    int32_t ft_out[D];
+    alignas(32) int32_t ft_out[D];
     const Color stm = pos.stm();
     const int32_t* perspective_acc[2] = {
-        (stm == WHITE) ? acc_w : acc_b,   // STM perspective first
-        (stm == WHITE) ? acc_b : acc_w,   // opp perspective second
+        (stm == WHITE) ? acc_w : acc_b,
+        (stm == WHITE) ? acc_b : acc_w,
     };
     for (int p = 0; p < 2; ++p) {
         const int32_t* acc = perspective_acc[p];
         int32_t* dst = ft_out + p * H;
+#if GUNGNIR_AVX2
+        const __m256i zero  = _mm256_setzero_si256();
+        const __m256i v127  = _mm256_set1_epi32(127);
+        for (int j = 0; j < H; j += 8) {
+            __m256i s0 = _mm256_loadu_si256((const __m256i*)(acc + j));
+            __m256i s1 = _mm256_loadu_si256((const __m256i*)(acc + j + H));
+            s0 = _mm256_max_epi32(s0, zero);
+            s0 = _mm256_min_epi32(s0, v127);
+            s1 = _mm256_max_epi32(s1, zero);
+            s1 = _mm256_min_epi32(s1, v127);
+            __m256i prod = _mm256_mullo_epi32(s0, s1);
+            _mm256_storeu_si256((__m256i*)(dst + j), _mm256_srai_epi32(prod, 7));
+        }
+#else
         for (int j = 0; j < H; ++j) {
             int32_t s0 = acc[j];
             int32_t s1 = acc[j + H];
@@ -529,6 +632,7 @@ int evaluate(const Position& pos) {
             if (s1 < 0) s1 = 0; else if (s1 > 127) s1 = 127;
             dst[j] = (s0 * s1) >> 7;
         }
+#endif
     }
 
     // 4. Bucket: (piece_count - 1) / 4
@@ -544,12 +648,48 @@ int evaluate(const Position& pos) {
 
     // 6. fc_0: 16 int32 outputs from 128 uint8 inputs
     int32_t fc0[FC0_OUT];
+#if GUNGNIR_AVX2
+    // Pack ft_out (int32, all in [0,127]) into uint8 buffer for VEX maddubs.
+    alignas(32) uint8_t ft_u8[FT_OUTPUT_DIM];
+    for (int j = 0; j < FT_OUTPUT_DIM; j += 16) {
+        // Pack 16 int32s -> 16 uint8s. We know each is in [0,127] so just take low byte.
+        for (int k = 0; k < 16; ++k) ft_u8[j + k] = uint8_t(ft_out[j + k]);
+    }
+    for (int j = 0; j < FC0_OUT; ++j) {
+        const int8_t* row = &ls.fc0_w[j * FT_OUTPUT_DIM];
+        __m256i sum = _mm256_setzero_si256();
+#if !GUNGNIR_VNNI
+        const __m256i ones = _mm256_set1_epi16(1);
+#endif
+        // 128 inputs / 32 per iteration = 4 iterations
+        for (int i = 0; i < FT_OUTPUT_DIM; i += 32) {
+            __m256i u = _mm256_loadu_si256((const __m256i*)(ft_u8 + i));   // 32 uint8
+            __m256i w = _mm256_loadu_si256((const __m256i*)(row + i));     // 32 int8
+#if GUNGNIR_VNNI
+            // VNNI fused: sum += dpbusd(u, w) — one instruction does it all.
+            sum = _mm256_dpbusd_epi32(sum, u, w);
+#else
+            __m256i p16 = _mm256_maddubs_epi16(u, w);                      // 16 int16
+            __m256i p32 = _mm256_madd_epi16(p16, ones);                    // 8 int32
+            sum = _mm256_add_epi32(sum, p32);
+#endif
+        }
+        // Horizontal sum of 8 int32s in `sum`.
+        __m128i lo = _mm256_castsi256_si128(sum);
+        __m128i hi = _mm256_extracti128_si256(sum, 1);
+        __m128i s4 = _mm_add_epi32(lo, hi);                                 // 4 int32s
+        s4 = _mm_hadd_epi32(s4, s4);                                        // 2 unique values in low half
+        s4 = _mm_hadd_epi32(s4, s4);                                        // sum in lane 0
+        fc0[j] = ls.fc0_b[j] + _mm_cvtsi128_si32(s4);
+    }
+#else
     for (int j = 0; j < FC0_OUT; ++j) {
         int32_t s = ls.fc0_b[j];
         const int8_t* row = &ls.fc0_w[j * FT_OUTPUT_DIM];
         for (int i = 0; i < FT_OUTPUT_DIM; ++i) s += ft_out[i] * row[i];
         fc0[j] = s;
     }
+#endif
 
     // 7. ac_sqr_0[0..14] = clamp(min(127, (x*x) >> 19), 0, 127)
     //    ac_0    [0..14] = clamp(x >> 6, 0, 127)

@@ -33,10 +33,14 @@ struct Entry {
 // Initialize table with `mb` megabytes of capacity. Calling again resizes.
 void init(size_t mb = 16);
 void clear();
-void new_search();              // bump generation (currently unused but reserved)
+void new_search();              // bump generation
 
 Entry* probe(u64 key, bool& found);
 void   store(u64 key, Move m, int score, int depth, Bound b);
+
+// Prefetch the cluster for `key` into L1. Caller does this just before computing
+// `key` is needed (e.g., between making a move and recursing). Sessions 38 + 41.
+void   prefetch(u64 key);
 
 }  // namespace TT
 

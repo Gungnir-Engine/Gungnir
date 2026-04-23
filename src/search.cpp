@@ -55,21 +55,23 @@ constexpr int SCORE_KILLER1     =    90'000;
 constexpr int SCORE_KILLER2     =    80'000;
 constexpr int MAX_PLY           = 96;
 
-// --- LMR table (Sessions 27): reduction[depth][move_index] = log-formula
+// --- LMR table (Sessions 27 + 39 retune): reduction = base + log(d) * log(m) / divisor.
+// Session 39 tuning: dropped base from 0.75 → 0.50 and divisor from 2.25 → 2.00 —
+// slightly more aggressive at shallow depths/late moves where the gain dominates.
 int g_lmr_table[64][64];
 void init_lmr_table() {
     static bool done = false; if (done) return; done = true;
     for (int d = 1; d < 64; ++d)
         for (int m = 1; m < 64; ++m)
-            g_lmr_table[d][m] = int(0.75 + std::log(double(d)) * std::log(double(m)) / 2.25);
+            g_lmr_table[d][m] = int(0.50 + std::log(double(d)) * std::log(double(m)) / 2.00);
 }
 
-// --- Late move pruning thresholds (Session 28)
-constexpr int LMP_THRESHOLD[7] = {0, 5, 8, 14, 22, 32, 45};
+// --- Late move pruning thresholds (Session 28; 39 widened slightly)
+constexpr int LMP_THRESHOLD[7] = {0, 4, 7, 12, 19, 28, 40};
 
-// --- Pruning margins (Session 28)
-constexpr int RFP_MARGIN_PER_DEPTH = 80;   // reverse futility (static null)
-constexpr int FUTILITY_MARGIN      = 100;  // standard futility
+// --- Pruning margins (Session 28; 39 retuned)
+constexpr int RFP_MARGIN_PER_DEPTH = 75;   // reverse futility (static null) — was 80
+constexpr int FUTILITY_MARGIN      = 110;  // standard futility — was 100
 
 // Killers + history persist across the iterative-deepening run (cleared at
 // start of each `search()`). All thread_local — each LazySMP worker keeps
@@ -197,8 +199,12 @@ inline int score_from_tt(int score, int ply) {
 
 // --- Quiescence search -----------------------------------------------------
 // Stand-pat + capture extensions. Avoids horizon effects from captures.
+// Time-check granularity (Session 42): tighter for short time controls so we
+// don't overshoot a 5-ms budget. Set in `search()` based on hard_ms.
+thread_local u64 g_time_check_mask = 2047;
+
 int qsearch(Position& pos, int alpha, int beta, int ply) {
-    if ((++g_nodes & 2047) == 0 && should_stop()) {
+    if ((++g_nodes & g_time_check_mask) == 0 && should_stop()) {
         g_aborted = true;
         return 0;
     }
@@ -263,7 +269,7 @@ constexpr int MAX_EXTENSIONS = 16;
 
 int negamax(Position& pos, int depth, int alpha, int beta, int ply, int extensions,
             bool did_null, Move excluded_move, Move* pv, int* pv_len) {
-    if ((++g_nodes & 2047) == 0 && should_stop()) {
+    if ((++g_nodes & g_time_check_mask) == 0 && should_stop()) {
         g_aborted = true;
         return 0;
     }
@@ -365,6 +371,13 @@ int negamax(Position& pos, int depth, int alpha, int beta, int ply, int extensio
     int  orig_alpha = alpha;
     int  quiets_searched = 0;
     Move quiets_seen[64];  // for history malus on quiets that didn't cut
+
+    // Prefetch first move's TT cluster — overlap memory latency with move ordering.
+    if (list.size > 0) {
+        // Best-effort: we don't know the resulting hash without making the move.
+        // Instead prefetch the current cluster (already in cache typically).
+        TT::prefetch(pos.hash());
+    }
 
     for (int i = 0; i < list.size; ++i) {
         const Move m = pick_next(scored, list.size, i);
@@ -540,6 +553,18 @@ SearchInfo search(Position& pos, const SearchLimits& limits) {
     clear_killers_history();
     if (NNUE::is_loaded() && NNUE::is_enabled()) NNUE::refresh(pos);
 
+    // Time-check granularity (Session 42): tighter on short budgets, looser on long.
+    // Mask values must be 2^k − 1 so `(nodes & mask) == 0` fires every 2^k nodes.
+    if (limits.infinite || limits.hard_ms <= 0) {
+        g_time_check_mask = 8191;  // ~8K nodes between checks (rare time pressure)
+    } else if (limits.hard_ms <= 50) {
+        g_time_check_mask = 255;   // very tight: check every 256 nodes
+    } else if (limits.hard_ms <= 500) {
+        g_time_check_mask = 1023;  // medium: 1K nodes
+    } else {
+        g_time_check_mask = 2047;  // long: 2K nodes (default)
+    }
+
     SearchInfo result;
     result.best_move = MOVE_NULL;
 
@@ -553,13 +578,16 @@ SearchInfo search(Position& pos, const SearchLimits& limits) {
     int  prev_iter_time     = 0;
 
     for (int depth = 1; depth <= limits.max_depth; ++depth) {
-        // Aspiration window from depth 4 onward.
+        // Aspiration window (Sessions 19 + 40): start tight from depth 4, widen
+        // adaptively on fails. Smaller initial delta + 1.5x growth (instead of 2x)
+        // gives faster convergence in the common case where score is near prev.
         int alpha = -VALUE_INF, beta = VALUE_INF;
-        int delta = 25;
+        int delta = 18;            // tighter than before (was 25)
         if (depth >= 4) {
             alpha = prev_score - delta;
             beta  = prev_score + delta;
         }
+        int aspiration_fails = 0;
 
         int score;
         while (true) {
@@ -568,10 +596,13 @@ SearchInfo search(Position& pos, const SearchLimits& limits) {
             if (score <= alpha) {            // fail low — widen alpha
                 beta  = (alpha + beta) / 2;
                 alpha = std::max(score - delta, -VALUE_INF);
-                delta += delta;
+                ++aspiration_fails;
+                // Adaptive growth: small fails grow 1.5x, repeated fails grow 2x.
+                delta = (aspiration_fails >= 3) ? delta * 2 : delta + delta / 2;
             } else if (score >= beta) {      // fail high — widen beta
                 beta = std::min(score + delta,  VALUE_INF);
-                delta += delta;
+                ++aspiration_fails;
+                delta = (aspiration_fails >= 3) ? delta * 2 : delta + delta / 2;
             } else {
                 break;
             }
