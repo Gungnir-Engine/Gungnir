@@ -80,6 +80,7 @@ public:
     Square ep_square() const { return state_.ep_square; }
     int    halfmove() const  { return state_.halfmove; }
     int    fullmove() const  { return fullmove_; }
+    Piece  captured() const  { return state_.captured; }  // valid right after make_move
 
     // True if any piece of color `by` attacks square `s` given the current
     // board occupancy.

@@ -135,6 +135,11 @@ int main(int argc, char** argv) {
     }
 
     std::string mode = argv[1];
+    // For movegen-only modes, disable NNUE to skip incremental-accumulator
+    // overhead (we don't need the eval).
+    if (mode == "perft" || mode == "divide" || mode == "hashtest" || mode == "reptest") {
+        NNUE::set_enabled(false);
+    }
     if (mode == "reptest") {
         print_banner();
         return run_reptest();
@@ -170,6 +175,7 @@ int main(int argc, char** argv) {
         Position pos;
         for (auto& t : tests) {
             pos.set_from_fen(t.fen);
+            NNUE::refresh(pos);
             int feat_w[40], feat_b[40];
             const int nw = NNUE::features(pos, 0, feat_w);
             const int nb = NNUE::features(pos, 1, feat_b);

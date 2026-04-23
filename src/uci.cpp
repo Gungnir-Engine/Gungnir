@@ -6,6 +6,7 @@
 #include "search.h"
 #include "tt.h"
 
+#include <algorithm>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -13,6 +14,8 @@
 namespace gungnir {
 
 namespace {
+
+int g_threads = 1;
 
 void cmd_position(Position& pos, std::istringstream& iss) {
     std::string sub;
@@ -40,6 +43,8 @@ void cmd_position(Position& pos, std::istringstream& iss) {
             pos.make_move(m);
         }
     }
+    // After (re)setting the position, NNUE accumulator must be rebuilt.
+    if (NNUE::is_loaded() && NNUE::is_enabled()) NNUE::refresh(pos);
 }
 
 void cmd_go(Position& pos, std::istringstream& iss) {
@@ -76,7 +81,8 @@ void cmd_go(Position& pos, std::istringstream& iss) {
         }
     }
 
-    SearchInfo info = search(pos, limits);
+    SearchInfo info = (g_threads > 1) ? search_smp(pos, limits, g_threads)
+                                       : search(pos, limits);
     if (info.best_move == MOVE_NULL) {
         // No moves searched — emit a recognizable "null" so the GUI doesn't hang.
         std::cout << "bestmove 0000" << std::endl;
@@ -102,9 +108,10 @@ int uci_loop() {
         if (!(iss >> token)) continue;
 
         if (token == "uci") {
-            std::cout << "id name Gungnir 0.4-dev" << std::endl;
+            std::cout << "id name Gungnir 0.5-dev" << std::endl;
             std::cout << "id author Gungnir-Engine" << std::endl;
             std::cout << "option name Hash type spin default 16 min 1 max 1024" << std::endl;
+            std::cout << "option name Threads type spin default 1 min 1 max 64" << std::endl;
             std::cout << "option name UseNNUE type check default true" << std::endl;
             std::cout << "option name NNUEFile type string default nn-small.nnue" << std::endl;
             std::cout << "uciok" << std::endl;
@@ -124,6 +131,8 @@ int uci_loop() {
             }
             if (name == "Hash") {
                 try { TT::init(size_t(std::stoi(value))); } catch (...) {}
+            } else if (name == "Threads") {
+                try { g_threads = std::max(1, std::stoi(value)); } catch (...) {}
             } else if (name == "UseNNUE") {
                 NNUE::set_enabled(value == "true" || value == "True" || value == "1");
             } else if (name == "NNUEFile") {

@@ -344,7 +344,161 @@ int features(const Position& pos, int perspective, int* out) {
 }
 
 // ============================================================================
-// Forward pass — matches Stockfish portable path exactly
+// Incremental accumulator stack (Session 24)
+// ============================================================================
+
+namespace {
+
+struct Accumulator {
+    int32_t acc[2][FT_OUTPUT_DIM];     // [perspective][unit]
+    int32_t psqt[2][PSQT_BUCKETS];     // [perspective][bucket]
+};
+
+// Stack of accumulator entries indexed by ply. Top = current. Push on
+// on_make, pop on on_unmake. Per-thread for LazySMP.
+constexpr int ACC_STACK_SIZE = 1025;
+thread_local Accumulator g_acc[ACC_STACK_SIZE];
+thread_local int g_acc_top = 0;
+
+void rebuild_perspective(Accumulator& a, const Position& pos, int p) {
+    int feats[40];
+    const int n = features(pos, p, feats);
+    for (int i = 0; i < FT_OUTPUT_DIM; ++i) a.acc[p][i] = g_ft_biases[i];
+    for (int f = 0; f < n; ++f) {
+        const int16_t* row = &g_ft_weights[size_t(feats[f]) * FT_OUTPUT_DIM];
+        for (int i = 0; i < FT_OUTPUT_DIM; ++i) a.acc[p][i] += row[i];
+    }
+    for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] = 0;
+    for (int f = 0; f < n; ++f) {
+        const int32_t* row = &g_ft_psqt_weights[size_t(feats[f]) * PSQT_BUCKETS];
+        for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] += row[k];
+    }
+}
+
+inline int feature_index(int p, Square king_sq, Piece piece, Square sq) {
+    return (int(sq) ^ g_orient[p][king_sq]) + PieceSquareIndex[p][piece] + g_king_buckets[p][king_sq];
+}
+
+inline void apply_remove(Accumulator& a, int p, int feat) {
+    const int16_t* row = &g_ft_weights[size_t(feat) * FT_OUTPUT_DIM];
+    for (int j = 0; j < FT_OUTPUT_DIM; ++j) a.acc[p][j] -= row[j];
+    const int32_t* prow = &g_ft_psqt_weights[size_t(feat) * PSQT_BUCKETS];
+    for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] -= prow[k];
+}
+
+inline void apply_add(Accumulator& a, int p, int feat) {
+    const int16_t* row = &g_ft_weights[size_t(feat) * FT_OUTPUT_DIM];
+    for (int j = 0; j < FT_OUTPUT_DIM; ++j) a.acc[p][j] += row[j];
+    const int32_t* prow = &g_ft_psqt_weights[size_t(feat) * PSQT_BUCKETS];
+    for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] += prow[k];
+}
+
+}  // namespace
+
+void refresh(const Position& pos) {
+    g_acc_top = 0;
+    rebuild_perspective(g_acc[0], pos, 0);
+    rebuild_perspective(g_acc[0], pos, 1);
+}
+
+void on_make(const Position& pos, Move m) {
+    if (!g_loaded || !g_enabled) return;
+    if (g_acc_top + 1 >= ACC_STACK_SIZE) return;  // safety
+
+    g_acc_top++;
+    Accumulator& cur = g_acc[g_acc_top];
+    const Accumulator& prev = g_acc[g_acc_top - 1];
+
+    const Color us = ~pos.stm();   // side that just moved
+    const Square from = m.from();
+    const Square to   = m.to();
+    const MoveType mt = m.type();
+
+    // Detect king moves. For castling, the king of `us` definitely moved.
+    bool king_moved[2] = {false, false};
+    if (mt == MT_CASTLING) {
+        king_moved[us] = true;
+    } else {
+        // For non-castling: the moving piece is now at `to`. If it's a king,
+        // mark this side. (Promotion can't move a king.)
+        const Piece moved_now = pos.piece_on(to);
+        if (mt != MT_PROMOTION && type_of(moved_now) == KING) {
+            king_moved[us] = true;
+        }
+    }
+
+    // For each perspective: rebuild if its king moved, else copy prev + delta.
+    for (int p = 0; p < 2; ++p) {
+        if (king_moved[p]) {
+            rebuild_perspective(cur, pos, p);
+            continue;
+        }
+        // Copy prev to cur, then apply delta.
+        std::memcpy(cur.acc[p],  prev.acc[p],  sizeof(cur.acc[p]));
+        std::memcpy(cur.psqt[p], prev.psqt[p], sizeof(cur.psqt[p]));
+
+        const Color me = (p == 0) ? WHITE : BLACK;
+        const Square king_sq = pos.king_square(me);
+
+        if (mt == MT_EN_PASSANT) {
+            const Piece our_pawn = make_piece(us, PAWN);
+            const Piece their_pawn = make_piece(~us, PAWN);
+            const Square cap_sq = Square(int(to) + (us == WHITE ? -8 : 8));
+            apply_remove(cur, p, feature_index(p, king_sq, our_pawn, from));
+            apply_remove(cur, p, feature_index(p, king_sq, their_pawn, cap_sq));
+            apply_add   (cur, p, feature_index(p, king_sq, our_pawn, to));
+        } else if (mt == MT_PROMOTION) {
+            const Piece our_pawn = make_piece(us, PAWN);
+            const Piece promoted = pos.piece_on(to);
+            const Piece captured = pos.captured();
+            apply_remove(cur, p, feature_index(p, king_sq, our_pawn, from));
+            if (captured != NO_PIECE) {
+                apply_remove(cur, p, feature_index(p, king_sq, captured, to));
+            }
+            apply_add(cur, p, feature_index(p, king_sq, promoted, to));
+        } else if (mt == MT_CASTLING) {
+            // Only opposite-side perspective reaches here (own side rebuilt above).
+            const Piece king = make_piece(us, KING);
+            const Piece rook = make_piece(us, ROOK);
+            Square rook_from, rook_to;
+            if      (to == SQ_G1) { rook_from = SQ_H1; rook_to = SQ_F1; }
+            else if (to == SQ_C1) { rook_from = SQ_A1; rook_to = SQ_D1; }
+            else if (to == SQ_G8) { rook_from = SQ_H8; rook_to = SQ_F8; }
+            else                  { rook_from = SQ_A8; rook_to = SQ_D8; }
+            apply_remove(cur, p, feature_index(p, king_sq, king, from));
+            apply_remove(cur, p, feature_index(p, king_sq, rook, rook_from));
+            apply_add   (cur, p, feature_index(p, king_sq, king, to));
+            apply_add   (cur, p, feature_index(p, king_sq, rook, rook_to));
+        } else {
+            // Normal move (possibly capture).
+            const Piece moved = pos.piece_on(to);
+            const Piece captured = pos.captured();
+            apply_remove(cur, p, feature_index(p, king_sq, moved, from));
+            if (captured != NO_PIECE) {
+                apply_remove(cur, p, feature_index(p, king_sq, captured, to));
+            }
+            apply_add(cur, p, feature_index(p, king_sq, moved, to));
+        }
+    }
+}
+
+void on_unmake() {
+    if (g_acc_top > 0) g_acc_top--;
+}
+
+void on_null_make() {
+    if (!g_loaded || !g_enabled) return;
+    if (g_acc_top + 1 >= ACC_STACK_SIZE) return;
+    g_acc_top++;
+    g_acc[g_acc_top] = g_acc[g_acc_top - 1];  // unchanged copy
+}
+
+void on_null_unmake() {
+    if (g_acc_top > 0) g_acc_top--;
+}
+
+// ============================================================================
+// Forward pass — uses cached accumulator from top of stack
 // ============================================================================
 
 int evaluate(const Position& pos) {
@@ -352,40 +506,16 @@ int evaluate(const Position& pos) {
     constexpr int D = FT_OUTPUT_DIM;     // 128
     constexpr int H = D / 2;              // 64
 
-    int feat_w[40], feat_b[40];
-    const int n_w = features(pos, 0, feat_w);
-    const int n_b = features(pos, 1, feat_b);
-
-    // 1. FT accumulators (start from biases, add feature rows)
-    int32_t acc_w[D], acc_b[D];
-    for (int i = 0; i < D; ++i) {
-        acc_w[i] = g_ft_biases[i];
-        acc_b[i] = g_ft_biases[i];
-    }
-    for (int f = 0; f < n_w; ++f) {
-        const int16_t* row = &g_ft_weights[size_t(feat_w[f]) * D];
-        for (int i = 0; i < D; ++i) acc_w[i] += row[i];
-    }
-    for (int f = 0; f < n_b; ++f) {
-        const int16_t* row = &g_ft_weights[size_t(feat_b[f]) * D];
-        for (int i = 0; i < D; ++i) acc_b[i] += row[i];
-    }
-
-    // 2. PSQT accumulators
-    int32_t psqt_w[PSQT_BUCKETS] = {0}, psqt_b[PSQT_BUCKETS] = {0};
-    for (int f = 0; f < n_w; ++f) {
-        const int32_t* row = &g_ft_psqt_weights[size_t(feat_w[f]) * PSQT_BUCKETS];
-        for (int k = 0; k < PSQT_BUCKETS; ++k) psqt_w[k] += row[k];
-    }
-    for (int f = 0; f < n_b; ++f) {
-        const int32_t* row = &g_ft_psqt_weights[size_t(feat_b[f]) * PSQT_BUCKETS];
-        for (int k = 0; k < PSQT_BUCKETS; ++k) psqt_b[k] += row[k];
-    }
+    const Accumulator& a = g_acc[g_acc_top];
+    const int32_t* acc_w = a.acc[0];
+    const int32_t* acc_b = a.acc[1];
+    const int32_t* psqt_w = a.psqt[0];
+    const int32_t* psqt_b = a.psqt[1];
 
     // 3. Pairwise transform (for each perspective: ft[j] = clamp(acc[j],0,127) * clamp(acc[j+H],0,127) / 128)
     int32_t ft_out[D];
     const Color stm = pos.stm();
-    int32_t* perspective_acc[2] = {
+    const int32_t* perspective_acc[2] = {
         (stm == WHITE) ? acc_w : acc_b,   // STM perspective first
         (stm == WHITE) ? acc_b : acc_w,   // opp perspective second
     };
@@ -406,9 +536,9 @@ int evaluate(const Position& pos) {
     const int bucket = (piece_count - 1) / 4;
 
     // 5. PSQT diff
-    const int32_t* psqt_stm = (stm == WHITE) ? psqt_w : psqt_b;
-    const int32_t* psqt_opp = (stm == WHITE) ? psqt_b : psqt_w;
-    const int32_t psqt = (psqt_stm[bucket] - psqt_opp[bucket]) / 2;
+    const int32_t* p_stm = (stm == WHITE) ? psqt_w : psqt_b;
+    const int32_t* p_opp = (stm == WHITE) ? psqt_b : psqt_w;
+    const int32_t psqt = (p_stm[bucket] - p_opp[bucket]) / 2;
 
     const LayerStack& ls = g_stacks[bucket];
 

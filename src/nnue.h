@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "move.h"
 #include "position.h"
 
 #include <cstddef>
@@ -24,6 +25,25 @@ bool load(const std::string& path);
 bool is_loaded();
 void set_enabled(bool on);
 bool is_enabled();
+
+// --- Incremental accumulator (Session 24) ---
+// `refresh` rebuilds both perspectives from scratch — call it whenever the
+// position is set fresh (after FEN parse or any non-incremental change).
+void refresh(const Position& pos);
+
+// Call AFTER pos.make_move(m) but BEFORE recursing. Pushes a new accumulator
+// entry derived from the previous one + this move's feature delta. King moves
+// trigger a full rebuild of that side's accumulator (because the king bucket
+// and orient changes affect every feature on that perspective).
+void on_make(const Position& pos, Move m);
+
+// Call AFTER pos.unmake_move(m) (or before — order doesn't matter, this just
+// pops the accumulator stack).
+void on_unmake();
+
+// Null-move support: pushes an unchanged copy on the stack.
+void on_null_make();
+void on_null_unmake();
 
 // Forward pass — returns Stockfish-internal centipawns from STM POV.
 // Caller should only call this when is_loaded() && is_enabled().

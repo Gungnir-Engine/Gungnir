@@ -36,7 +36,11 @@ struct SearchInfo {
 // Prints `info ...` lines after each completed iteration.
 SearchInfo search(Position& pos, const SearchLimits& limits);
 
-// Convenience wrappers.
+// LazySMP: spawn N threads, all searching the same root + sharing TT.
+// Returns the main thread's result. Falls back to single-thread when n==1.
+SearchInfo search_smp(Position& pos, const SearchLimits& limits, int n_threads);
+
+// Convenience wrappers (single-threaded).
 SearchInfo search_depth(Position& pos, int depth);     // fixed depth, no time limit
 SearchInfo search_movetime(Position& pos, int ms);     // fixed time budget
 
