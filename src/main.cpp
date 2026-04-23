@@ -156,6 +156,22 @@ int main(int argc, char** argv) {
         return run_bench(depth);
     }
 
+    // Session 43: distillation pipeline pointer. Prints recipe and exits.
+    if (mode == "distill") {
+        print_banner();
+        std::cout <<
+            "NNUE distillation pipeline:\n"
+            "\n"
+            "  Step 1: gungnir genfens <num_games> fens.txt [depth=4] [random_plies=8]\n"
+            "  Step 2: python tools/label_fens.py fens.txt labels.txt --depth 12\n"
+            "  Step 3: python tools/train_nnue.py labels.txt weights.bin --epochs 10\n"
+            "          (skeleton only; for SF-format output use nnue-pytorch repo)\n"
+            "  Step 4: setoption name NNUEFile value path/to/your-trained.nnue   (in UCI)\n"
+            "\n"
+            "See tools/README.md for full details.\n";
+        return 0;
+    }
+
     // Session 43: FEN export for NNUE distillation.
     // `gungnir genfens <numGames> <output.txt> [searchDepth=4] [randomPlies=8]`
     // Plays N self-play games at the requested depth, with `randomPlies` uniformly

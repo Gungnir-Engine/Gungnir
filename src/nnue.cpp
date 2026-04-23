@@ -47,11 +47,11 @@ namespace NNUE {
 // Constants — small-net architecture
 // ============================================================================
 
-constexpr unsigned long EXPECTED_VERSION   = 0x7AF32F20UL;
-constexpr unsigned long EXPECTED_ARCH_HASH = 0x1C103C92UL;
-constexpr unsigned long EXPECTED_FT_HASH   = 0x7F234DB8UL;
-constexpr int FT_INPUT_DIM   = 22528;     // HalfKAv2_hm
-constexpr int FT_OUTPUT_DIM  = 128;       // TransformedFeatureDimensionsSmall
+constexpr unsigned long EXPECTED_VERSION       = 0x7AF32F20UL;
+constexpr unsigned long ARCH_HASH_SMALL_NET    = 0x1C103C92UL;  // L1=128
+constexpr unsigned long ARCH_HASH_BIG_NET      = 0x3C103C92UL;  // L1=3072 (SF main)
+constexpr unsigned long EXPECTED_FT_HASH_SMALL = 0x7F234DB8UL;
+constexpr int FT_INPUT_DIM   = 22528;     // HalfKAv2_hm (same for both nets)
 constexpr int PSQT_BUCKETS   = 8;
 constexpr int LAYER_STACKS   = 8;
 constexpr int L2             = 15;        // FC_0 outputs we use (16th is skip)
@@ -61,6 +61,12 @@ constexpr int FC1_OUT        = 32;
 constexpr int FC2_IN_PAD     = 32;
 constexpr int LEB128_MAGIC_LEN = 17;
 constexpr const char* LEB128_MAGIC_STR = "COMPRESSED_LEB128";
+
+// Session 37: g_ft_dim is now a runtime variable so the same binary can
+// load either the small net (L1=128) or the big net (L1=3072). Set on load.
+// Compile-time MAX is the cap that buffer sizing assumes.
+constexpr int FT_DIM_MAX = 3072;
+int g_ft_dim = 128;   // default to small net dimensions
 
 // HalfKAv2_hm piece-square index bases (from half_ka_v2_hm.h).
 constexpr int PS_NB        = 11 * 64;
@@ -210,16 +216,17 @@ unsigned long g_arch_hash = 0;
 unsigned long g_ft_hash = 0;
 std::string g_desc;
 
-// FT biases, weights, PSQT weights.
-std::vector<int16_t> g_ft_biases;        // size = FT_OUTPUT_DIM
-std::vector<int16_t> g_ft_weights;       // size = FT_INPUT_DIM * FT_OUTPUT_DIM
+// FT biases, weights, PSQT weights — sized at load time based on g_ft_dim.
+std::vector<int16_t> g_ft_biases;        // size = g_ft_dim
+std::vector<int16_t> g_ft_weights;       // size = FT_INPUT_DIM * g_ft_dim
 std::vector<int32_t> g_ft_psqt_weights;  // size = PSQT_BUCKETS * FT_INPUT_DIM
 
-// 8 layer stacks — each owns small dense arrays.
+// 8 layer stacks. fc0_w is the dimension-dependent piece (16 * g_ft_dim int8s);
+// stored in a vector that's sized at load. Other layers are fixed.
 struct LayerStack {
     uint32_t hash;
     int32_t  fc0_b[FC0_OUT];          // 16 int32 biases
-    int8_t   fc0_w[FC0_OUT * FT_OUTPUT_DIM];  // 16 * 128
+    std::vector<int8_t> fc0_w;        // 16 * g_ft_dim int8s, sized on load
     int32_t  fc1_b[FC1_OUT];          // 32 int32 biases
     int8_t   fc1_w[FC1_OUT * FC1_IN_PAD];     // 32 * 32
     int32_t  fc2_b[1];
@@ -280,42 +287,41 @@ bool load(const std::string& path) {
                   << " (expected 0x" << EXPECTED_VERSION << ")" << std::dec << std::endl;
         return false;
     }
-    // Session 37: bigger SF nets (e.g. nn-1111cefa1111.nnue, ~133 MB) have a
-    // different arch hash and L1=3072 instead of 128. Loading those requires
-    // dynamic allocation of FT/layer-stack arrays sized at runtime — out of
-    // scope for now. We warn and refuse to load anything other than the small net.
-    constexpr unsigned long EXPECTED_BIG_ARCH_HASH = 0x3C103C92UL;  // SF main net
-    if (g_arch_hash != EXPECTED_ARCH_HASH) {
-        if (g_arch_hash == EXPECTED_BIG_ARCH_HASH) {
-            std::cerr << "NNUE: this is the BIG net (L1=3072). The current build is "
-                         "compiled for the SMALL net (L1=128); refusing to load. To "
-                         "support both, layer dimensions must be made runtime-variable "
-                         "(deferred refactor). Use the small net instead.\n";
-        } else {
-            std::cerr << "NNUE: arch hash 0x" << std::hex << g_arch_hash
-                      << " is unrecognized (expected 0x" << EXPECTED_ARCH_HASH
-                      << ")" << std::dec << "\n";
-        }
+    // Session 37: detect arch and pick L1 dimension. Both small (L1=128) and
+    // big (L1=3072) nets share architecture; only FT_OUTPUT_DIM differs.
+    if (g_arch_hash == ARCH_HASH_SMALL_NET) {
+        g_ft_dim = 128;
+    } else if (g_arch_hash == ARCH_HASH_BIG_NET) {
+        g_ft_dim = 3072;
+    } else {
+        std::cerr << "NNUE: arch hash 0x" << std::hex << g_arch_hash
+                  << " is unrecognized (expected small=0x" << ARCH_HASH_SMALL_NET
+                  << " or big=0x" << ARCH_HASH_BIG_NET << ")" << std::dec << "\n";
+        return false;
+    }
+    if (g_ft_dim > FT_DIM_MAX) {
+        std::cerr << "NNUE: g_ft_dim=" << g_ft_dim << " exceeds FT_DIM_MAX="
+                  << FT_DIM_MAX << " — recompile with a larger cap.\n";
         return false;
     }
     if (end - p < 4) return false;
     g_ft_hash = read_u32(p);
 
     // Feature transformer (LEB128-compressed)
-    g_ft_biases.assign(FT_OUTPUT_DIM, 0);
-    g_ft_weights.assign(size_t(FT_INPUT_DIM) * FT_OUTPUT_DIM, 0);
+    g_ft_biases.assign(g_ft_dim, 0);
+    g_ft_weights.assign(size_t(FT_INPUT_DIM) * g_ft_dim, 0);
     g_ft_psqt_weights.assign(size_t(PSQT_BUCKETS) * FT_INPUT_DIM, 0);
 
     {
-        std::vector<int32_t> tmp(FT_OUTPUT_DIM);
-        if (!read_leb128(&p, end, FT_OUTPUT_DIM, 16, tmp.data())) {
+        std::vector<int32_t> tmp(g_ft_dim);
+        if (!read_leb128(&p, end, g_ft_dim, 16, tmp.data())) {
             std::cerr << "NNUE: FT biases LEB128 parse failed" << std::endl;
             return false;
         }
-        for (int i = 0; i < FT_OUTPUT_DIM; ++i) g_ft_biases[i] = int16_t(tmp[i]);
+        for (int i = 0; i < g_ft_dim; ++i) g_ft_biases[i] = int16_t(tmp[i]);
     }
     {
-        std::vector<int32_t> tmp(size_t(FT_INPUT_DIM) * FT_OUTPUT_DIM);
+        std::vector<int32_t> tmp(size_t(FT_INPUT_DIM) * g_ft_dim);
         if (!read_leb128(&p, end, int(tmp.size()), 16, tmp.data())) {
             std::cerr << "NNUE: FT weights LEB128 parse failed" << std::endl;
             return false;
@@ -332,11 +338,12 @@ bool load(const std::string& path) {
         if (end - p < 4) return false;
         g_stacks[s].hash = read_u32(p);
 
-        // fc_0
-        if (end - p < int(sizeof(int32_t)) * FC0_OUT + FC0_OUT * FT_OUTPUT_DIM) return false;
+        // fc_0 — width depends on g_ft_dim. Allocate per-stack vector to fit.
+        if (end - p < int(sizeof(int32_t)) * FC0_OUT + FC0_OUT * g_ft_dim) return false;
         for (int i = 0; i < FC0_OUT; ++i) g_stacks[s].fc0_b[i] = read_i32(p);
-        std::memcpy(g_stacks[s].fc0_w, p, FC0_OUT * FT_OUTPUT_DIM);
-        p += FC0_OUT * FT_OUTPUT_DIM;
+        g_stacks[s].fc0_w.assign(size_t(FC0_OUT) * g_ft_dim, 0);
+        std::memcpy(g_stacks[s].fc0_w.data(), p, size_t(FC0_OUT) * g_ft_dim);
+        p += size_t(FC0_OUT) * g_ft_dim;
 
         // fc_1
         if (end - p < int(sizeof(int32_t)) * FC1_OUT + FC1_OUT * FC1_IN_PAD) return false;
@@ -397,13 +404,20 @@ int features(const Position& pos, int perspective, int* out) {
 
 namespace {
 
+// Each Accumulator carries up to FT_DIM_MAX int32s per perspective.
+// For the small net only the first 128 entries are touched; for the big net
+// the first 3072 are. Wastes ~24 KB per accumulator at small-net sizes but
+// keeps the data layout flat and avoids per-Accumulator heap allocation
+// (which would be costly on the search hot path).
 struct Accumulator {
-    int32_t acc[2][FT_OUTPUT_DIM];     // [perspective][unit]
-    int32_t psqt[2][PSQT_BUCKETS];     // [perspective][bucket]
+    int32_t acc[2][FT_DIM_MAX];   // [perspective][unit]
+    int32_t psqt[2][PSQT_BUCKETS];       // [perspective][bucket]
 };
 
 // Stack of accumulator entries indexed by ply. Top = current. Push on
 // on_make, pop on on_unmake. Per-thread for LazySMP.
+// At FT_DIM_MAX=3072 each Accumulator is ~24 KB; 1025 * 24 = ~25 MB
+// per thread (sizable but acceptable; multi-thread setups should be aware).
 constexpr int ACC_STACK_SIZE = 1025;
 thread_local Accumulator g_acc[ACC_STACK_SIZE];
 thread_local int g_acc_top = 0;
@@ -414,13 +428,13 @@ void rebuild_perspective(Accumulator& a, const Position& pos, int p) {
     int32_t* dst = a.acc[p];
 #if GUNGNIR_AVX2
     // Init dst from int16 biases (sign-extended), then add feature rows.
-    for (int j = 0; j < FT_OUTPUT_DIM; j += 8) {
+    for (int j = 0; j < g_ft_dim; j += 8) {
         __m128i s = _mm_loadu_si128((const __m128i*)(g_ft_biases.data() + j));
         _mm256_storeu_si256((__m256i*)(dst + j), _mm256_cvtepi16_epi32(s));
     }
     for (int f = 0; f < n; ++f) {
-        const int16_t* row = &g_ft_weights[size_t(feats[f]) * FT_OUTPUT_DIM];
-        for (int j = 0; j < FT_OUTPUT_DIM; j += 8) {
+        const int16_t* row = &g_ft_weights[size_t(feats[f]) * g_ft_dim];
+        for (int j = 0; j < g_ft_dim; j += 8) {
             __m128i s   = _mm_loadu_si128((const __m128i*)(row + j));
             __m256i s32 = _mm256_cvtepi16_epi32(s);
             __m256i d   = _mm256_loadu_si256((__m256i*)(dst + j));
@@ -428,10 +442,10 @@ void rebuild_perspective(Accumulator& a, const Position& pos, int p) {
         }
     }
 #else
-    for (int i = 0; i < FT_OUTPUT_DIM; ++i) dst[i] = g_ft_biases[i];
+    for (int i = 0; i < g_ft_dim; ++i) dst[i] = g_ft_biases[i];
     for (int f = 0; f < n; ++f) {
-        const int16_t* row = &g_ft_weights[size_t(feats[f]) * FT_OUTPUT_DIM];
-        for (int i = 0; i < FT_OUTPUT_DIM; ++i) dst[i] += row[i];
+        const int16_t* row = &g_ft_weights[size_t(feats[f]) * g_ft_dim];
+        for (int i = 0; i < g_ft_dim; ++i) dst[i] += row[i];
     }
 #endif
     for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] = 0;
@@ -446,11 +460,11 @@ inline int feature_index(int p, Square king_sq, Piece piece, Square sq) {
 }
 
 inline void apply_remove(Accumulator& a, int p, int feat) {
-    const int16_t* row = &g_ft_weights[size_t(feat) * FT_OUTPUT_DIM];
+    const int16_t* row = &g_ft_weights[size_t(feat) * g_ft_dim];
     int32_t* dst = a.acc[p];
 #if GUNGNIR_AVX2
     // 128 int32 -= sign-extended int16. 8 int32s per iteration.
-    for (int j = 0; j < FT_OUTPUT_DIM; j += 8) {
+    for (int j = 0; j < g_ft_dim; j += 8) {
         __m128i s   = _mm_loadu_si128((const __m128i*)(row + j));
         __m256i s32 = _mm256_cvtepi16_epi32(s);
         __m256i d   = _mm256_loadu_si256((__m256i*)(dst + j));
@@ -458,17 +472,17 @@ inline void apply_remove(Accumulator& a, int p, int feat) {
         _mm256_storeu_si256((__m256i*)(dst + j), d);
     }
 #else
-    for (int j = 0; j < FT_OUTPUT_DIM; ++j) dst[j] -= row[j];
+    for (int j = 0; j < g_ft_dim; ++j) dst[j] -= row[j];
 #endif
     const int32_t* prow = &g_ft_psqt_weights[size_t(feat) * PSQT_BUCKETS];
     for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] -= prow[k];
 }
 
 inline void apply_add(Accumulator& a, int p, int feat) {
-    const int16_t* row = &g_ft_weights[size_t(feat) * FT_OUTPUT_DIM];
+    const int16_t* row = &g_ft_weights[size_t(feat) * g_ft_dim];
     int32_t* dst = a.acc[p];
 #if GUNGNIR_AVX2
-    for (int j = 0; j < FT_OUTPUT_DIM; j += 8) {
+    for (int j = 0; j < g_ft_dim; j += 8) {
         __m128i s   = _mm_loadu_si128((const __m128i*)(row + j));
         __m256i s32 = _mm256_cvtepi16_epi32(s);
         __m256i d   = _mm256_loadu_si256((__m256i*)(dst + j));
@@ -476,7 +490,7 @@ inline void apply_add(Accumulator& a, int p, int feat) {
         _mm256_storeu_si256((__m256i*)(dst + j), d);
     }
 #else
-    for (int j = 0; j < FT_OUTPUT_DIM; ++j) dst[j] += row[j];
+    for (int j = 0; j < g_ft_dim; ++j) dst[j] += row[j];
 #endif
     const int32_t* prow = &g_ft_psqt_weights[size_t(feat) * PSQT_BUCKETS];
     for (int k = 0; k < PSQT_BUCKETS; ++k) a.psqt[p][k] += prow[k];
@@ -523,7 +537,9 @@ void on_make(const Position& pos, Move m) {
             continue;
         }
         // Copy prev to cur, then apply delta.
-        std::memcpy(cur.acc[p],  prev.acc[p],  sizeof(cur.acc[p]));
+        // Only copy the bytes actually in use (g_ft_dim is 128 for small,
+        // 3072 for big; sizeof(cur.acc[p]) is always 12288 = max-sized).
+        std::memcpy(cur.acc[p],  prev.acc[p],  size_t(g_ft_dim) * sizeof(int32_t));
         std::memcpy(cur.psqt[p], prev.psqt[p], sizeof(cur.psqt[p]));
 
         const Color me = (p == 0) ? WHITE : BLACK;
@@ -579,7 +595,13 @@ void on_null_make() {
     if (!g_loaded || !g_enabled) return;
     if (g_acc_top + 1 >= ACC_STACK_SIZE) return;
     g_acc_top++;
-    g_acc[g_acc_top] = g_acc[g_acc_top - 1];  // unchanged copy
+    // Copy only the bytes in use (avoids 24KB copy at small-net sizes).
+    Accumulator& cur = g_acc[g_acc_top];
+    const Accumulator& prev = g_acc[g_acc_top - 1];
+    for (int p = 0; p < 2; ++p) {
+        std::memcpy(cur.acc[p],  prev.acc[p],  size_t(g_ft_dim) * sizeof(int32_t));
+        std::memcpy(cur.psqt[p], prev.psqt[p], sizeof(cur.psqt[p]));
+    }
 }
 
 void on_null_unmake() {
@@ -592,8 +614,8 @@ void on_null_unmake() {
 
 int evaluate(const Position& pos) {
     if (!g_loaded) return 0;
-    constexpr int D = FT_OUTPUT_DIM;     // 128
-    constexpr int H = D / 2;              // 64
+    const int D = g_ft_dim;     // runtime: 128 (small) or 3072 (big)
+    const int H = D / 2;
 
     const Accumulator& a = g_acc[g_acc_top];
     const int32_t* acc_w = a.acc[0];
@@ -602,7 +624,7 @@ int evaluate(const Position& pos) {
     const int32_t* psqt_b = a.psqt[1];
 
     // 3. Pairwise transform (for each perspective: ft[j] = clamp(acc[j],0,127) * clamp(acc[j+H],0,127) / 128)
-    alignas(32) int32_t ft_out[D];
+    alignas(32) int32_t ft_out[FT_DIM_MAX];
     const Color stm = pos.stm();
     const int32_t* perspective_acc[2] = {
         (stm == WHITE) ? acc_w : acc_b,
@@ -650,19 +672,19 @@ int evaluate(const Position& pos) {
     int32_t fc0[FC0_OUT];
 #if GUNGNIR_AVX2
     // Pack ft_out (int32, all in [0,127]) into uint8 buffer for VEX maddubs.
-    alignas(32) uint8_t ft_u8[FT_OUTPUT_DIM];
-    for (int j = 0; j < FT_OUTPUT_DIM; j += 16) {
+    alignas(32) uint8_t ft_u8[FT_DIM_MAX];
+    for (int j = 0; j < g_ft_dim; j += 16) {
         // Pack 16 int32s -> 16 uint8s. We know each is in [0,127] so just take low byte.
         for (int k = 0; k < 16; ++k) ft_u8[j + k] = uint8_t(ft_out[j + k]);
     }
     for (int j = 0; j < FC0_OUT; ++j) {
-        const int8_t* row = &ls.fc0_w[j * FT_OUTPUT_DIM];
+        const int8_t* row = &ls.fc0_w[j * g_ft_dim];
         __m256i sum = _mm256_setzero_si256();
 #if !GUNGNIR_VNNI
         const __m256i ones = _mm256_set1_epi16(1);
 #endif
         // 128 inputs / 32 per iteration = 4 iterations
-        for (int i = 0; i < FT_OUTPUT_DIM; i += 32) {
+        for (int i = 0; i < g_ft_dim; i += 32) {
             __m256i u = _mm256_loadu_si256((const __m256i*)(ft_u8 + i));   // 32 uint8
             __m256i w = _mm256_loadu_si256((const __m256i*)(row + i));     // 32 int8
 #if GUNGNIR_VNNI
@@ -685,8 +707,8 @@ int evaluate(const Position& pos) {
 #else
     for (int j = 0; j < FC0_OUT; ++j) {
         int32_t s = ls.fc0_b[j];
-        const int8_t* row = &ls.fc0_w[j * FT_OUTPUT_DIM];
-        for (int i = 0; i < FT_OUTPUT_DIM; ++i) s += ft_out[i] * row[i];
+        const int8_t* row = &ls.fc0_w[j * g_ft_dim];
+        for (int i = 0; i < g_ft_dim; ++i) s += ft_out[i] * row[i];
         fc0[j] = s;
     }
 #endif
