@@ -44,7 +44,8 @@ from gungnir_nnue import (
 from train_halfka import GungnirHalfKA
 
 VERSION         = 0x7AF32F20
-ARCH_HASH_SMALL = 0x1C103C92
+ARCH_HASH_SMALL = 0x1C103C92   # L1=128
+ARCH_HASH_BIG   = 0x3C103C92   # L1=3072 (SF main)
 FT_HASH         = 0x7F234DB8
 LEB128_MAGIC    = b"COMPRESSED_LEB128"   # 17 bytes exactly
 
@@ -122,14 +123,26 @@ def main():
                     help='Save all-zero weights (sanity-checks the file format only)')
     args = ap.parse_args()
 
-    net = GungnirHalfKA()
+    # Detect FT output dim from the checkpoint so the same script handles
+    # both the small net (L1=128, arch hash 0x1C103C92) and the big net
+    # (L1=3072, arch hash 0x3C103C92).
     if not args.zero:
         state = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
+        ft_shape = state['ft.weight'].shape
+        detected_dim = ft_shape[1]
+    else:
+        detected_dim = FT_OUTPUT_DIM
+
+    net = GungnirHalfKA(ft_output_dim=detected_dim)
+    if not args.zero:
         net.load_state_dict(state)
+    print(f"FT output dim: {detected_dim}  (arch: {'big' if detected_dim == 3072 else 'small'})")
+
+    arch_hash = ARCH_HASH_BIG if detected_dim == 3072 else ARCH_HASH_SMALL
 
     # --- Gather float weights into numpy ---
-    ft_w     = net.ft.weight.detach().numpy()          # [22528, 128]
-    ft_b     = net.ft_bias.detach().numpy()            # [128]
+    ft_w     = net.ft.weight.detach().numpy()          # [22528, ft_dim]
+    ft_b     = net.ft_bias.detach().numpy()            # [ft_dim]
     psqt_w   = net.psqt.weight.detach().numpy()        # [22528, 8]
 
     fc0_w_all = [net.fc0[i].weight.detach().numpy() for i in range(LAYER_STACKS)]   # [16, 128]
@@ -188,7 +201,7 @@ def main():
     with open(args.output, 'wb') as f:
         # Header
         f.write(struct.pack('<I', VERSION))
-        f.write(struct.pack('<I', ARCH_HASH_SMALL))
+        f.write(struct.pack('<I', arch_hash))
         f.write(struct.pack('<I', len(desc_bytes)))
         f.write(desc_bytes)
 

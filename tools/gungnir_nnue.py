@@ -14,8 +14,9 @@ import numpy as np
 # Constants (match src/nnue.cpp)
 # ============================================================================
 
-FT_INPUT_DIM   = 22528           # HalfKAv2_hm
-FT_OUTPUT_DIM  = 128             # small net
+FT_INPUT_DIM       = 22528       # HalfKAv2_hm
+FT_OUTPUT_DIM      = 128         # small net (default)
+FT_OUTPUT_DIM_BIG  = 3072        # big net (SF main arch hash 0x3C103C92)
 PSQT_BUCKETS   = 8
 LAYER_STACKS   = 8
 L2             = 15              # fc_0 outputs used (16th is skip)

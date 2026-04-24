@@ -26,7 +26,7 @@ import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gungnir_nnue import (
-    FT_INPUT_DIM, FT_OUTPUT_DIM, PSQT_BUCKETS, LAYER_STACKS,
+    FT_INPUT_DIM, FT_OUTPUT_DIM, FT_OUTPUT_DIM_BIG, PSQT_BUCKETS, LAYER_STACKS,
     L2, FC0_OUT, FC1_IN_PAD, FC1_OUT, FC2_IN_PAD,
     halfka_features, fen_to_board,
 )
@@ -76,16 +76,17 @@ def fake_quant(w, bits):
 
 
 class GungnirHalfKA(nn.Module):
-    def __init__(self):
+    def __init__(self, ft_output_dim=FT_OUTPUT_DIM):
         super().__init__()
+        self.ft_output_dim = ft_output_dim
         # Feature transformer: sparse sum via EmbeddingBag.
-        self.ft = nn.EmbeddingBag(FT_INPUT_DIM, FT_OUTPUT_DIM, mode='sum')
-        self.ft_bias = nn.Parameter(torch.zeros(FT_OUTPUT_DIM))
+        self.ft = nn.EmbeddingBag(FT_INPUT_DIM, ft_output_dim, mode='sum')
+        self.ft_bias = nn.Parameter(torch.zeros(ft_output_dim))
         # PSQT: 8 buckets × FT_INPUT_DIM.
         self.psqt = nn.EmbeddingBag(FT_INPUT_DIM, PSQT_BUCKETS, mode='sum')
 
         # 8 layer stacks. Each has its own fc_0 / fc_1 / fc_2.
-        self.fc0 = nn.ModuleList([nn.Linear(FT_OUTPUT_DIM, FC0_OUT) for _ in range(LAYER_STACKS)])
+        self.fc0 = nn.ModuleList([nn.Linear(ft_output_dim, FC0_OUT) for _ in range(LAYER_STACKS)])
         self.fc1 = nn.ModuleList([nn.Linear(FC1_IN_PAD, FC1_OUT) for _ in range(LAYER_STACKS)])
         self.fc2 = nn.ModuleList([nn.Linear(FC2_IN_PAD, 1) for _ in range(LAYER_STACKS)])
 
@@ -99,7 +100,12 @@ class GungnirHalfKA(nn.Module):
         # Layer weights std=3 → rounded int8 values ±2-9.
         nn.init.normal_(self.ft.weight, mean=0.0, std=5.0)
         nn.init.constant_(self.ft_bias, 30.0)
-        nn.init.zeros_(self.psqt.weight)
+        # PSQT was zeros -> weights barely grew (observed max 3.76 after 3 epochs).
+        # Non-zero init (std=3) gives the per-piece-per-square channel a
+        # starting range so it can contribute material signal from epoch 1.
+        # With 32 active features per sample, a PSQT contribution of ~208
+        # (= 1 pawn in SF-internal-cp) requires avg weight ~13 -> std=3 bootstrap is sane.
+        nn.init.normal_(self.psqt.weight, mean=0.0, std=3.0)
         for stack in (self.fc0, self.fc1, self.fc2):
             for lin in stack:
                 nn.init.normal_(lin.weight, mean=0.0, std=3.0)
@@ -149,7 +155,7 @@ class GungnirHalfKA(nn.Module):
         acc_opp = acc_b * (1 - stm_f) + acc_w * stm_f
 
         # Pairwise transform: clamp(a[:H], 0, 127) * clamp(a[H:], 0, 127) / 128
-        H = FT_OUTPUT_DIM // 2                                       # 64
+        H = self.ft_output_dim // 2                                   # 64 small / 1536 big
         def pairwise(a):
             s0 = torch.clamp(a[:, :H], 0.0, 127.0)
             s1 = torch.clamp(a[:, H:], 0.0, 127.0)
@@ -218,6 +224,8 @@ class GungnirHalfKA(nn.Module):
 # ============================================================================
 
 class LabelsDataset(torch.utils.data.Dataset):
+    """Legacy text-based dataset. Recomputes features every __getitem__.
+    Prefer PrecomputedLabelsDataset for real training."""
     def __init__(self, path, max_rows=-1):
         self.samples = []   # list of (fen, score_cp)
         print(f"Loading labels from {path}...", flush=True)
@@ -248,6 +256,35 @@ class LabelsDataset(torch.utils.data.Dataset):
         if bucket < 0: bucket = 0
         if bucket > 7: bucket = 7
         return fw, fb, stm, bucket, score
+
+
+class PrecomputedLabelsDataset(torch.utils.data.Dataset):
+    """Loads pre-computed features from an .npz produced by
+    tools/precompute_features.py. Orders of magnitude faster than
+    LabelsDataset because feature extraction was done once, up front."""
+    def __init__(self, path, max_rows=-1):
+        print(f"Loading precomputed features from {path}...", flush=True)
+        data = np.load(path, mmap_mode='r')
+        self.feats_w = data['feats_w']   # int16 [N, 32]
+        self.feats_b = data['feats_b']
+        self.nfeat_w = data['nfeat_w']   # int8 [N]
+        self.nfeat_b = data['nfeat_b']
+        self.stm     = data['stm']
+        self.bucket  = data['bucket']
+        self.score   = data['score']     # int32 [N]
+        n_total = len(self.stm)
+        self.n = n_total if max_rows < 0 else min(max_rows, n_total)
+        print(f"  {self.n} samples (of {n_total} available)", flush=True)
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        nw = int(self.nfeat_w[idx])
+        nb = int(self.nfeat_b[idx])
+        fw = self.feats_w[idx, :nw].astype(np.int64, copy=False).tolist()
+        fb = self.feats_b[idx, :nb].astype(np.int64, copy=False).tolist()
+        return fw, fb, int(self.stm[idx]), int(self.bucket[idx]), int(self.score[idx])
 
 
 def collate(batch):
@@ -288,22 +325,51 @@ def main():
                     help='Save checkpoint every N epochs (default: 5)')
     ap.add_argument('--warm-start', default=None,
                     help='Load existing checkpoint before training (for fine-tuning).')
+    ap.add_argument('--precomputed', default=None,
+                    help='Path to .npz from tools/precompute_features.py '
+                         '(much faster than regenerating features per-epoch).')
+    ap.add_argument('--compile', action='store_true',
+                    help='Apply torch.compile() to the model.')
+    ap.add_argument('--device', default=None,
+                    help="Override device ('cuda' or 'cpu'). Default: auto.")
+    ap.add_argument('--pred-div',   type=float, default=416.0,
+                    help='Sigmoid divisor applied to pred (default 416 so '
+                         'equilibrium pred = score * pred_div / target_div).')
+    ap.add_argument('--target-div', type=float, default=200.0,
+                    help='Sigmoid divisor applied to label (default 200).')
+    ap.add_argument('--big-net', action='store_true',
+                    help='Use L1=3072 (SF main arch hash 0x3C103C92) instead of L1=128.')
     args = ap.parse_args()
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}", flush=True)
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
 
-    ds = LabelsDataset(args.labels, max_rows=args.max)
+    if args.precomputed:
+        ds = PrecomputedLabelsDataset(args.precomputed, max_rows=args.max)
+    else:
+        ds = LabelsDataset(args.labels, max_rows=args.max)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=args.batch, shuffle=True,
         num_workers=args.workers, collate_fn=collate,
+        pin_memory=(device.type == 'cuda'),
+        persistent_workers=(args.workers > 0),
     )
 
-    net = GungnirHalfKA().to(device)
+    ft_dim = FT_OUTPUT_DIM_BIG if args.big_net else FT_OUTPUT_DIM
+    print(f"Net: L1={ft_dim} ({'big' if args.big_net else 'small'} net)", flush=True)
+    net = GungnirHalfKA(ft_output_dim=ft_dim).to(device)
     if args.warm_start:
         print(f"Warm-starting from {args.warm_start}", flush=True)
         state = torch.load(args.warm_start, map_location=device, weights_only=True)
         net.load_state_dict(state)
+    if args.compile:
+        print("Compiling model via torch.compile()...", flush=True)
+        net = torch.compile(net)
     opt = optim.Adam(net.parameters(), lr=args.lr)
 
     # Sigmoid-MSE loss tuned so training equilibrium places `pred` in
@@ -320,8 +386,10 @@ def main():
     # off gently toward saturation around |score|>=1500 cp. Mate-labelled
     # positions (±30000) saturate cleanly — gradient decays naturally, no
     # clipping needed.
-    PRED_SIG_DIV   = 416.0
-    TARGET_SIG_DIV = 200.0
+    PRED_SIG_DIV   = args.pred_div
+    TARGET_SIG_DIV = args.target_div
+    print(f"Loss divisors: pred/{PRED_SIG_DIV} vs target/{TARGET_SIG_DIV} "
+          f"(eq: pred = score * {PRED_SIG_DIV/TARGET_SIG_DIV:.2f})", flush=True)
     def compute_loss(pred, score):
         pred_sig = torch.sigmoid(pred / PRED_SIG_DIV)
         target   = torch.sigmoid(score / TARGET_SIG_DIV)
@@ -333,7 +401,7 @@ def main():
         t0 = time.time()
         total_loss, n_batches = 0.0, 0
         for batch in loader:
-            wf, wo, bf, bo, stm, bk, sc = [t.to(device) for t in batch]
+            wf, wo, bf, bo, stm, bk, sc = [t.to(device, non_blocking=(device.type == 'cuda')) for t in batch]
             pred = net(wf, wo, bf, bo, stm, bk)
             loss = compute_loss(pred, sc)
             opt.zero_grad()
