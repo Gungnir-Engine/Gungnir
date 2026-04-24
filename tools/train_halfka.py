@@ -286,6 +286,8 @@ def main():
     ap.add_argument('--workers',type=int, default=0)
     ap.add_argument('--save-every', type=int, default=5,
                     help='Save checkpoint every N epochs (default: 5)')
+    ap.add_argument('--warm-start', default=None,
+                    help='Load existing checkpoint before training (for fine-tuning).')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -298,12 +300,32 @@ def main():
     )
 
     net = GungnirHalfKA().to(device)
+    if args.warm_start:
+        print(f"Warm-starting from {args.warm_start}", flush=True)
+        state = torch.load(args.warm_start, map_location=device, weights_only=True)
+        net.load_state_dict(state)
     opt = optim.Adam(net.parameters(), lr=args.lr)
 
-    # Texel-style loss: sigmoid(eval / 400) should match sigmoid(target / 400).
-    # We compute MSE on the sigmoid-space targets.
-    def target_transform(score):
-        return torch.sigmoid(score / 400.0)
+    # Sigmoid-MSE loss tuned so training equilibrium places `pred` in
+    # SF-internal-cp (208 per pawn), which is exactly the scale eval.cpp's
+    # `raw * 100 / 208` expects for Gungnir cp output.
+    #
+    #   engine: return pred * 100 / 208   (want = label in pawn-cp)
+    #     => pred must converge to label * 2.08
+    #   trainer: pred_sig = sigmoid(pred / 416), target = sigmoid(score / 200)
+    #     equilibrium: pred / 416 = score / 200  =>  pred = score * 2.08  ✓
+    #
+    # The 200/416 pair keeps |score|<400cp firmly in the sigmoid's linear
+    # region (strong gradient for typical middlegame positions) and rolls
+    # off gently toward saturation around |score|>=1500 cp. Mate-labelled
+    # positions (±30000) saturate cleanly — gradient decays naturally, no
+    # clipping needed.
+    PRED_SIG_DIV   = 416.0
+    TARGET_SIG_DIV = 200.0
+    def compute_loss(pred, score):
+        pred_sig = torch.sigmoid(pred / PRED_SIG_DIV)
+        target   = torch.sigmoid(score / TARGET_SIG_DIV)
+        return ((pred_sig - target) ** 2).mean()
 
     print(f"Training {args.epochs} epoch(s), batch={args.batch}, lr={args.lr}, samples={len(ds)}", flush=True)
     for epoch in range(args.epochs):
@@ -313,11 +335,7 @@ def main():
         for batch in loader:
             wf, wo, bf, bo, stm, bk, sc = [t.to(device) for t in batch]
             pred = net(wf, wo, bf, bo, stm, bk)
-            # Pred is "internal cp / 16"; multiply back by ~16 to get cp, then / 400 for Texel.
-            # In practice train against the sigmoid target directly.
-            pred_sig = torch.sigmoid(pred * 16.0 / 400.0)
-            target   = target_transform(sc)
-            loss = ((pred_sig - target) ** 2).mean()
+            loss = compute_loss(pred, sc)
             opt.zero_grad()
             loss.backward()
             opt.step()

@@ -51,3 +51,11 @@ data/
 __pycache__/
 *.pyc
 *.pyo
+
+# fastchess outputs + config cache
+matches/
+config.json
+
+# Local virtualenvs
+.venv/
+.venv-gpu/
