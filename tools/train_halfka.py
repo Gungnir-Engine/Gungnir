@@ -263,12 +263,34 @@ class PrecomputedLabelsDataset(torch.utils.data.Dataset):
       (a) .npz archive -> full load, used for small datasets that fit in RAM.
       (b) directory of .npy files -> mmap_mode='r' per array, needed for
           datasets bigger than RAM (e.g. 50M+ positions at ~6.8 GB).
-    tools/npz_to_npy.py converts (a) -> (b)."""
+    tools/npz_to_npy.py converts (a) -> (b).
+
+    Lazy-load on first __getitem__ so the dataset is cheap to pickle across
+    DataLoader worker processes on Windows (spawn semantics). Each worker
+    opens its own memmap — no giant arrays in the pickle stream.
+    """
     def __init__(self, path, max_rows=-1):
-        print(f"Loading precomputed features from {path}...", flush=True)
+        self.path = path
+        self.max_rows = max_rows
+        self._loaded = False
+        # Minimal length peek — doesn't load the big arrays.
         if os.path.isdir(path):
+            stm_arr = np.load(os.path.join(path, 'stm.npy'), mmap_mode='r')
+            n_total = len(stm_arr)
+            del stm_arr
+        else:
+            with np.load(path, mmap_mode='r') as data:
+                n_total = len(data['stm'])
+        self.n = n_total if max_rows < 0 else min(max_rows, n_total)
+        print(f"Dataset {path}: {self.n} samples "
+              f"(of {n_total} available, lazy-loaded per-worker)", flush=True)
+
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        if os.path.isdir(self.path):
             def load(name):
-                return np.load(os.path.join(path, f'{name}.npy'), mmap_mode='r')
+                return np.load(os.path.join(self.path, f'{name}.npy'), mmap_mode='r')
             self.feats_w = load('feats_w')
             self.feats_b = load('feats_b')
             self.nfeat_w = load('nfeat_w')
@@ -277,7 +299,7 @@ class PrecomputedLabelsDataset(torch.utils.data.Dataset):
             self.bucket  = load('bucket')
             self.score   = load('score')
         else:
-            data = np.load(path, mmap_mode='r')
+            data = np.load(self.path, mmap_mode='r')
             self.feats_w = data['feats_w']
             self.feats_b = data['feats_b']
             self.nfeat_w = data['nfeat_w']
@@ -285,40 +307,45 @@ class PrecomputedLabelsDataset(torch.utils.data.Dataset):
             self.stm     = data['stm']
             self.bucket  = data['bucket']
             self.score   = data['score']
-        n_total = len(self.stm)
-        self.n = n_total if max_rows < 0 else min(max_rows, n_total)
-        print(f"  {self.n} samples (of {n_total} available)", flush=True)
+        self._loaded = True
 
     def __len__(self):
         return self.n
 
     def __getitem__(self, idx):
+        self._ensure_loaded()
         nw = int(self.nfeat_w[idx])
         nb = int(self.nfeat_b[idx])
-        fw = self.feats_w[idx, :nw].astype(np.int64, copy=False).tolist()
-        fb = self.feats_b[idx, :nb].astype(np.int64, copy=False).tolist()
+        # Return np.int64 arrays directly — collate() vectorizes on these.
+        fw = self.feats_w[idx, :nw].astype(np.int64, copy=False)
+        fb = self.feats_b[idx, :nb].astype(np.int64, copy=False)
         return fw, fb, int(self.stm[idx]), int(self.bucket[idx]), int(self.score[idx])
 
 
 def collate(batch):
-    w_all, b_all = [], []
-    w_off, b_off = [], []
-    stms, buckets, scores = [], [], []
-    for fw, fb, stm, bk, sc in batch:
-        w_off.append(len(w_all))
-        w_all.extend(fw)
-        b_off.append(len(b_all))
-        b_all.extend(fb)
-        stms.append(stm)
-        buckets.append(bk)
-        scores.append(sc)
-    return (torch.tensor(w_all, dtype=torch.long),
-            torch.tensor(w_off, dtype=torch.long),
-            torch.tensor(b_all, dtype=torch.long),
-            torch.tensor(b_off, dtype=torch.long),
-            torch.tensor(stms, dtype=torch.long),
-            torch.tensor(buckets, dtype=torch.long),
-            torch.tensor(scores, dtype=torch.float32))
+    """Numpy-vectorized collate. Samples arrive as (np.int64 features_w,
+    np.int64 features_b, int stm, int bucket, int score). Batched output
+    matches the layout EmbeddingBag-style (all features concatenated +
+    per-sample start offsets) that the forward pass expects."""
+    w_arrs = [b[0] for b in batch]
+    b_arrs = [b[1] for b in batch]
+    # Offsets: start index of each sample's features in the concatenated array.
+    w_sizes = np.fromiter((len(a) for a in w_arrs), dtype=np.int64, count=len(batch))
+    b_sizes = np.fromiter((len(a) for a in b_arrs), dtype=np.int64, count=len(batch))
+    w_off = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(w_sizes[:-1])])
+    b_off = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(b_sizes[:-1])])
+    w_all = np.concatenate(w_arrs) if w_arrs else np.zeros(0, dtype=np.int64)
+    b_all = np.concatenate(b_arrs) if b_arrs else np.zeros(0, dtype=np.int64)
+    stms    = np.fromiter((b[2] for b in batch), dtype=np.int64, count=len(batch))
+    buckets = np.fromiter((b[3] for b in batch), dtype=np.int64, count=len(batch))
+    scores  = np.fromiter((b[4] for b in batch), dtype=np.float32, count=len(batch))
+    return (torch.from_numpy(w_all),
+            torch.from_numpy(w_off),
+            torch.from_numpy(b_all),
+            torch.from_numpy(b_off),
+            torch.from_numpy(stms),
+            torch.from_numpy(buckets),
+            torch.from_numpy(scores))
 
 
 # ============================================================================
