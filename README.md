@@ -51,7 +51,7 @@ serialized `.nnue`).
 | v0.4   | ✅ HalfKAv2_hm NNUE loader + forward pass + incremental accumulator + AVX2 SIMD |
 | v0.5   | ✅ Search refinements (LMR, LMP, futility, PVS, singular extensions, cont/cap history) |
 | v0.6   | ✅ LazySMP multi-threading |
-| v0.7   | 🚧 Custom-trained weights pipeline |
+| v0.7   | ✅ Custom-trained NNUE (beats classical eval in self-play A/B) |
 | v1.0   | Tuned, SPRT-validated, competitive |
 
 ## Testing
