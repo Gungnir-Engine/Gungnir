@@ -259,19 +259,32 @@ class LabelsDataset(torch.utils.data.Dataset):
 
 
 class PrecomputedLabelsDataset(torch.utils.data.Dataset):
-    """Loads pre-computed features from an .npz produced by
-    tools/precompute_features.py. Orders of magnitude faster than
-    LabelsDataset because feature extraction was done once, up front."""
+    """Loads pre-computed features. Supports two layouts:
+      (a) .npz archive -> full load, used for small datasets that fit in RAM.
+      (b) directory of .npy files -> mmap_mode='r' per array, needed for
+          datasets bigger than RAM (e.g. 50M+ positions at ~6.8 GB).
+    tools/npz_to_npy.py converts (a) -> (b)."""
     def __init__(self, path, max_rows=-1):
         print(f"Loading precomputed features from {path}...", flush=True)
-        data = np.load(path, mmap_mode='r')
-        self.feats_w = data['feats_w']   # int16 [N, 32]
-        self.feats_b = data['feats_b']
-        self.nfeat_w = data['nfeat_w']   # int8 [N]
-        self.nfeat_b = data['nfeat_b']
-        self.stm     = data['stm']
-        self.bucket  = data['bucket']
-        self.score   = data['score']     # int32 [N]
+        if os.path.isdir(path):
+            def load(name):
+                return np.load(os.path.join(path, f'{name}.npy'), mmap_mode='r')
+            self.feats_w = load('feats_w')
+            self.feats_b = load('feats_b')
+            self.nfeat_w = load('nfeat_w')
+            self.nfeat_b = load('nfeat_b')
+            self.stm     = load('stm')
+            self.bucket  = load('bucket')
+            self.score   = load('score')
+        else:
+            data = np.load(path, mmap_mode='r')
+            self.feats_w = data['feats_w']
+            self.feats_b = data['feats_b']
+            self.nfeat_w = data['nfeat_w']
+            self.nfeat_b = data['nfeat_b']
+            self.stm     = data['stm']
+            self.bucket  = data['bucket']
+            self.score   = data['score']
         n_total = len(self.stm)
         self.n = n_total if max_rows < 0 else min(max_rows, n_total)
         print(f"  {self.n} samples (of {n_total} available)", flush=True)

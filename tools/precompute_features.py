@@ -29,11 +29,13 @@ from gungnir_nnue import halfka_features, fen_to_board
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('labels', help='FEN|score_cp per line')
-    ap.add_argument('--out', default=None, help='Output .npz path (default: <stem>.feats.npz)')
+    ap.add_argument('--out', default=None,
+                    help='Output directory (default: <stem>.feats/). '
+                         'If path ends with .npz, also writes legacy .npz archive.')
     ap.add_argument('--max', type=int, default=-1)
     args = ap.parse_args()
 
-    out_path = args.out or (os.path.splitext(args.labels)[0] + '.feats.npz')
+    out_path = args.out or (os.path.splitext(args.labels)[0] + '.feats')
 
     # First pass: count lines
     print(f"Counting lines in {args.labels}...", flush=True)
@@ -107,13 +109,32 @@ def main():
 
     dt = time.time() - t0
     print(f"\nDone. {idx} samples in {dt:.1f}s ({idx/dt:.0f}/s)")
-    print(f"Saving to {out_path}...")
-    np.savez(out_path,
-             feats_w=feats_w, feats_b=feats_b,
-             nfeat_w=nfeat_w, nfeat_b=nfeat_b,
-             stm=stm_a, bucket=bucket_a, score=score_a)
-    sz = os.path.getsize(out_path) / 1e6
-    print(f"Wrote {out_path} ({sz:.1f} MB)")
+    # Save as a directory of separate .npy files so each array can be
+    # memory-mapped independently. np.savez() writes a zip of .npy, which
+    # defeats mmap_mode='r' because individual arrays get extracted fully
+    # into RAM on access (observed with the 50M run — 3 GB feats_b array
+    # would OOM on 16 GB machines).
+    if out_path.endswith('.npz'):
+        # Legacy path: still write the .npz too, but also split into .npy
+        # in a sibling directory.
+        np.savez(out_path,
+                 feats_w=feats_w, feats_b=feats_b,
+                 nfeat_w=nfeat_w, nfeat_b=nfeat_b,
+                 stm=stm_a, bucket=bucket_a, score=score_a)
+        sz = os.path.getsize(out_path) / 1e6
+        print(f"Wrote {out_path} ({sz:.1f} MB)")
+        out_dir = out_path[:-4]  # strip .npz
+    else:
+        out_dir = out_path
+    os.makedirs(out_dir, exist_ok=True)
+    for name, arr in [('feats_w', feats_w), ('feats_b', feats_b),
+                      ('nfeat_w', nfeat_w), ('nfeat_b', nfeat_b),
+                      ('stm', stm_a), ('bucket', bucket_a), ('score', score_a)]:
+        p = os.path.join(out_dir, f'{name}.npy')
+        np.save(p, arr)
+    total = sum(os.path.getsize(os.path.join(out_dir, f'{n}.npy'))
+                for n in ['feats_w','feats_b','nfeat_w','nfeat_b','stm','bucket','score']) / 1e6
+    print(f"Wrote memmap-friendly .npy files in {out_dir}/ ({total:.1f} MB)")
 
 
 if __name__ == '__main__':
